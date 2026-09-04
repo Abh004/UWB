@@ -1,0 +1,20 @@
+# Exclude virtual environments
+novelda-uwb-demos/
+.venv/
+venv/
+
+# Exclude Python compiled files
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+scratch/
+documentation/
+bin/
+share/
+*.json
+RadarDirectInstall/
+lib/
+LibFT4222-v1.4.5
+X7_SDK_0.6_x64-win/
+human_dataset_2s_augmented/

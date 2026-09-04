@@ -1,0 +1,108 @@
+%% =============================================================================
+%% NOVELDA X7 DUAL-SENSOR RADAR AI ARCHITECTURE
+%% 1. 3D Gesture Recognition Pipeline (Late Fusion Siamese CNN)
+%% 2. 5-Class Presence / Occupancy Detection Pipeline (GPU-Accelerated 2D CNN)
+%% =============================================================================
+
+graph TB
+    %% -------------------------------------------------------------------------
+    %% TOP LEVEL SYSTEM INPUTS
+    %% -------------------------------------------------------------------------
+    subgraph HARDWARE ["Hardware Layer: Novelda X7 Dual UWB Radars"]
+        R1["Radar Sensor 1<br/>(Front Array - TX0/TX1, RX0/RX1)"]
+        R2["Radar Sensor 2<br/>(Side Array - TX0/TX1, RX0/RX1)"]
+    end
+
+    subgraph SDK ["Novelda X7 SDK Ingestion & Synchronization"]
+        SDK1["RadarDirectCallback (Sensor 1)<br/>Baseband Complex IQ Frame Assembly"]
+        SDK2["RadarDirectCallback (Sensor 2)<br/>Baseband Complex IQ Frame Assembly"]
+        SYNC["Software FIFO Queue & Sequence Synchronizer<br/>Tolerance: dt < 50ms"]
+    end
+
+    R1 --> SDK1
+    R2 --> SDK2
+    SDK1 --> SYNC
+    SDK2 --> SYNC
+
+    %% -------------------------------------------------------------------------
+    %% PIPELINE 1: 3D GESTURE RECOGNITION PIPELINE
+    %% -------------------------------------------------------------------------
+    subgraph GESTURE_PIPELINE ["Pipeline 1: 3D Gesture Recognition (64 Frames, 34 Bins)"]
+        direction TB
+        G_INPUT["Dual Virtual Frame Stream<br/>Shape: (64, 2, 2, 2, 34) complex64"]
+        
+        subgraph G_DSP ["Interferometric Signal Processing (Per Sensor)"]
+            G_MTI["1. MTI Static Clutter Subtraction<br/>w_mti = w - mean(w, axis=0)"]
+            G_H["2. Horizontal AoA Unit Phasor<br/>H = (TX0_RX0 * conj(TX1_RX0)) / |interf|"]
+            G_V["3. Vertical AoA Unit Phasor<br/>V = (TX0_RX0 * conj(TX0_RX1)) / |interf|"]
+            G_D["4. Temporal Doppler Velocity Phasor<br/>D(t) = (TX0_RX0(t) * conj(TX0_RX0(t-1))) / |interf|"]
+            G_AMP["5. Normalized Amplitude & Spatial Energy<br/>amp_norm, amp_H_norm"]
+            G_STACK["6. 8-Channel Physical Tensor Stack<br/>Shape per sensor: (8, 34, 64)"]
+        end
+
+        subgraph G_NET ["GestureCNN_X7_Dual (Late Fusion Siamese Architecture)"]
+            subgraph G_B1 ["Branch 1: Sensor 1 Spatial Feature Extractor"]
+                B1_C1["Conv2D(8->64, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
+                B1_C2["Conv2D(64->128, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
+                B1_C3["Conv2D(128->256, 3x3) + BN + ReLU + MaxPool(2)"]
+                B1_C4["Conv2D(256->512, 3x3) + BN + ReLU"]
+                B1_P["AdaptiveAvgPool2d((4, 4)) -> 8,192 features"]
+            end
+
+            subgraph G_B2 ["Branch 2: Sensor 2 Spatial Feature Extractor"]
+                B2_C1["Conv2D(8->64, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
+                B2_C2["Conv2D(64->128, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
+                B2_C3["Conv2D(128->256, 3x3) + BN + ReLU + MaxPool(2)"]
+                B2_C4["Conv2D(256->512, 3x3) + BN + ReLU"]
+                B2_P["AdaptiveAvgPool2d((4, 4)) -> 8,192 features"]
+            end
+
+            G_CAT["Feature Concatenation Layer<br/>16,384 Fused Dual-Sensor Features"]
+            G_FC1["Linear(16384 -> 512) + ReLU + Dropout(0.5)"]
+            G_FC2["Linear(512 -> 128) + ReLU + Dropout(0.3)"]
+            G_OUT["Linear(128 -> 7 Classes)<br/>SWIPE_LR, SWIPE_RL, SWIPE_UP, SWIPE_DOWN, PUSH_IN, PINCH, NOISE"]
+        end
+    end
+
+    SYNC --> G_INPUT
+    G_INPUT --> G_MTI
+    G_MTI --> G_H & G_V & G_D & G_AMP
+    G_H & G_V & G_D & G_AMP --> G_STACK
+    G_STACK --> B1_C1 & B2_C1
+    B1_C1 --> B1_C2 --> B1_C3 --> B1_C4 --> B1_P
+    B2_C1 --> B2_C2 --> B2_C3 --> B2_C4 --> B2_P
+    B1_P & B2_P --> G_CAT
+    G_CAT --> G_FC1 --> G_FC2 --> G_OUT
+
+    %% -------------------------------------------------------------------------
+    %% PIPELINE 2: 5-CLASS OCCUPANCY & PRESENCE DETECTION PIPELINE
+    %% -------------------------------------------------------------------------
+    subgraph PRESENCE_PIPELINE ["Pipeline 2: 5-Class Human Presence Detection (50 Frames, 339 Bins)"]
+        direction TB
+        P_INPUT["Dual Sensor Stream Buffer<br/>Shape: (B, 50, 2, 2, 2, 339) complex64"]
+
+        subgraph P_GPU_DSP ["Vectorized GPU Preprocessing (CUDA Tensors)"]
+            P_MTI["1. Vectorized Temporal MTI Subtraction<br/>w_mti = w - mean(w, dim=1, keepdim=True)"]
+            P_MAG["2. Complex Magnitude & 2TX x 2RX Averaging<br/>mag = |w_mti|, mag_avg = mean(mag, dim=(3,4))"]
+            P_LOG["3. Log-Amplitude Scaling<br/>mag_scaled = ln(1 + 100 * mag_avg)"]
+            P_PERM["4. Channel Permutation -> PyTorch Tensor<br/>Shape: (B, 2 Channels, 50 Frames, 339 Bins)"]
+        end
+
+        subgraph P_NET ["PresenceCNN_X7_Dual Architecture"]
+            P_BLK1["Block 1: Conv2D(2->16, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (16, 25, 169)"]
+            P_BLK2["Block 2: Conv2D(16->32, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (32, 12, 84)"]
+            P_BLK3["Block 3: Conv2D(32->64, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (64, 6, 42)"]
+            P_BLK4["Block 4: Conv2D(64->128, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (128, 3, 21)"]
+            P_GAP["AdaptiveAvgPool2d((1, 1)) -> (128, 1, 1)"]
+            P_DENSE["Flatten() -> Dropout(0.3) -> Linear(128 -> 5)"]
+            P_OUT["Softmax Probabilities (5 Occupancy States)<br/>0_people, 1_people, 2_people, 3_people, 4_people"]
+        end
+    end
+
+    SYNC --> P_INPUT
+    P_INPUT --> P_MTI
+    P_MTI --> P_MAG
+    P_MAG --> P_LOG
+    P_LOG --> P_PERM
+    P_PERM --> P_BLK1
+    P_BLK1 --> P_BLK2 --> P_BLK3 --> P_BLK4 --> P_GAP --> P_DENSE --> P_OUT
