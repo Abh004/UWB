@@ -1,7 +1,11 @@
-numpy
-tensorflow
-scikit-learn
-matplotlib
-tf2onnx
-onnx
-psutil
+# Core runtime for the dual-sensor X7 radar pipelines (PyTorch, not TensorFlow).
+#
+# CUDA note: the RTX 5090 is Blackwell (sm_120). Stock PyPI wheels do not ship
+# sm_120 kernels; install from the matching CUDA index instead, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+torch>=2.6
+numpy>=1.24
+scikit-learn>=1.3
+
+# Optional: only needed by the plotting/analysis helpers, not by train/eval/live.
+matplotlib>=3.7

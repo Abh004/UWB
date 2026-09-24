@@ -7,7 +7,7 @@
 
 This repository contains the end-to-end pr         oduction AI software stack for **Dual Novelda X7 Ultra-Wideband (IR-UWB) Transceiver Radars**. The system provides real-time, touchless human-machine interaction and environmental awareness via two core machine learning pipelines:
 
-1. **3D Touchless Gesture Recognition:** A dual-branch Siamese / Late-Fusion Convolutional Neural Network that decodes spatial interferometry and Doppler micro-motion across 7 gesture classes (**93.77% Overall Accuracy**).
+1. **3D Touchless Gesture Recognition:** A dual-branch Siamese / Late-Fusion Convolutional Neural Network that decodes spatial interferometry and Doppler micro-motion across **5 directional gesture classes** (**94.74% validation accuracy**, 89.1% through the full live capture path). Runs **continuously with no activation gesture**.
 2. **5-State Human Presence & Occupancy Detection:** A GPU-accelerated multi-scale 2D CNN that counts human occupants ($0$, $1$, $2$, $3$, or $4$ people) from chest breathing micro-displacements and aggregate radar reflection energy (**94.00% Real-World Holdout Accuracy**).
 
 Both pipelines execute natively on **NVIDIA RTX 5090 (Blackwell Architecture, CUDA 13.2)** with zero-copy GPU tensor processing.
@@ -16,29 +16,52 @@ Both pipelines execute natively on **NVIDIA RTX 5090 (Blackwell Architecture, CU
 
 ## 2. Model Performance & Evaluation Metrics
 
-### A. 3D Gesture Recognition Model (`best_model_2s.pth`)
+### A. 3D Gesture Recognition Model (`best_model_2s_5class.pth`)
 
-Evaluated on **722 pure dual-sensor real-world test recordings** (`gesture_dataset_2s_new`):
+Five directional gestures, recognised continuously. **PINCH has been removed** — it
+was the gated-mode activation trigger but never fired reliably on live hardware, and
+carrying it in the label space also drew probability mass away from the directional
+gestures (measured on identical recordings: 98.3% vs 96.8% once its logit is removed).
 
-* **Overall Accuracy (Both Sensors Active):** **93.77%**
-* **Sensor 2 Only (Leave-One-Feature-Out / Sensor 1 Masked):** **64.27%**
-* **Sensor 1 Only (Leave-One-Feature-Out / Sensor 2 Masked):** **73.82%**
+* **Validation accuracy (held-out 20% split):** **94.74%**
+* **Full live-path accuracy (476 recordings, energy gate + capture + classify):** **89.1%**
 
-#### 7-Class Confusion Matrix:
+#### Per-class (validation split):
 ```text
-Row: Ground Truth | Col: Predicted Class
--------------------------------------------------------------------------
-Class ID | Class Name   |  G0   G1   G2   G3   G4   G5   G6 | Accuracy
--------------------------------------------------------------------------
-0        | SWIPE_LR     |  93    0    0    0    0    2    1 |   96.9%
-1        | SWIPE_RL     |   0   94    0    0    1    0    0 |   98.9%
-2        | SWIPE_UP     |   0    0   90    0    1    1    3 |   94.7%
-3        | SWIPE_DOWN   |   0    0    1   90    0    2    2 |   94.7%
-4        | PUSH_IN      |   0    0    0    0   94    0    1 |   98.9%
-5        | PINCH        |   0    0    0    0    0  114    1 |   99.1%
-6        | NOISE / IDLE |  13    2    0    2    5    7  102 |   77.3%
--------------------------------------------------------------------------
+Class           Prec    Recall     F1     N
+SWIPE_LR       90.0%    94.7%   92.3%    19
+SWIPE_RL       94.7%    94.7%   94.7%    19
+SWIPE_UP      100.0%    89.5%   94.4%    19
+SWIPE_DOWN     90.5%   100.0%   95.0%    19
+PUSH_IN       100.0%    94.7%   97.3%    19
 ```
+
+#### Live-path confusion matrix (row: true, col: predicted):
+```text
+              SWIPE_LR  SWIPE_RL  SWIPE_UP  SWIPE_DN   PUSH_IN
+SWIPE_LR            92         0         2         2         0
+SWIPE_RL             1        86         7         1         0
+SWIPE_UP             1         0        89         2         1
+SWIPE_DOWN           0         0        13        81         1
+PUSH_IN              1         1        14         3        76
+```
+
+> The legacy 7-class model (`best_model_2s.pth`, six gestures plus NOISE) is retained
+> in `models/` for reference. It cannot be retrained from `gesture_dataset_2s_new`,
+> which contains no NOISE recordings.
+
+#### Live capture is peak-driven, not fixed-length
+The lag between crossing the motion threshold and the gesture's energy peak is **not
+constant** — measured across the corpus it spans 1 to 97 frames, and its mean differs
+per gesture (SWIPE_UP ~17 frames, PUSH_IN ~34). A fixed capture length therefore
+centres the model's window correctly for some gestures and not others: with a fixed
+50-frame gather, PUSH_IN collapsed to 2/25 while swipes were unaffected.
+
+The capture instead tracks the running energy maximum and stops only once the gesture
+has demonstrably peaked — energy falling for `DECAY_FRAMES` consecutive frames **and**
+at least `POST_PEAK_FRAMES` elapsed since the peak, so the second half of the window
+holds real data rather than edge padding. This lifted the live path from 68.8% to
+**89.1%** with every class above 80%.
 
 ---
 
@@ -209,11 +232,13 @@ python -c "import torch; print('CUDA Ready:', torch.cuda.is_available(), '| GPU:
   ```
 * **Retrain Gesture Model:**
   ```powershell
-  python x7_2s_train.py --epochs 60
+  python x7_2s_train.py --epochs 80
   ```
-* **Live Dual-Radar Inference:**
+* **Live Dual-Radar Inference (continuous, no activation gesture):**
   ```powershell
   python x7_2s_live.py --host1 <PORT_OR_IP_1> --host2 <PORT_OR_IP_2>
+  # tune the motion gate for your room if needed:
+  python x7_2s_live.py --host1 529 --host2 545 --threshold 600
   ```
 
 ### 2. Human Presence & Occupancy Detection

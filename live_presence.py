@@ -1,3 +1,17 @@
+"""
+DEPRECATED -- superseded by x7_2s_live_presence.py
+==================================================
+This is the original Keras/TensorFlow presence demo. It is retained for
+reference only and is NOT part of the active pipeline:
+
+  * It loads `presence_2d_cnn.h5`, which is not present in this repository.
+  * It requires TensorFlow, which is no longer a project dependency
+    (see requirements.txt -- the active stack is PyTorch).
+  * It reads a single sensor and predates the dual-sensor MIMO format.
+
+Use `x7_2s_live_presence.py` instead.
+"""
+
 import os
 import sys
 import argparse

@@ -5,10 +5,16 @@ Generates intra-class synthetic radar dataset from real recordings.
 - Splits real data into 80% Train and 20% Holdout Test.
 - Synthesizes N new variations per sample using physics-based transformations:
   * Range-bin translation (simulating target distance variations)
-  * Temporal cyclic rolling (simulating continuous breathing phase shift)
+  * Temporal phase-continuous shift (simulating breathing phase offset)
   * Complex phase rotation & micro-motion modulation
   * Per-sensor amplitude scaling (simulating body size and angle of arrival)
-  * Complex Gaussian noise injection
+  * Complex Gaussian noise injection scaled to the MTI residual
+
+Physics note: additive noise is sized relative to the MTI RESIDUAL, not the raw
+signal. The raw standard deviation is dominated by static clutter that the MTI
+filter removes downstream, so noise scaled to it arrives several times larger
+than the surviving moving-target signal and inflates the log-energy features the
+presence model consumes.
 """
 
 import os
@@ -16,6 +22,21 @@ import argparse
 import random
 from pathlib import Path
 import numpy as np
+
+from x7_physics import mti_noise_scale, complex_gaussian_noise
+
+# Presence capture runs at 10 FPS (see x7_2s_record_presence.RADAR_FPS).
+FRAME_RATE_HZ = 10.0
+# +/-15 bins at the MEASURED 71.4 mm/bin -> +/-1.07 m of range translation.
+MAX_RANGE_SHIFT_BINS = 15
+
+
+def _reset_dir(path: Path):
+    """Create `path`, removing any .npy left over from a previous run."""
+    path.mkdir(parents=True, exist_ok=True)
+    for stale in path.glob("*.npy"):
+        stale.unlink()
+
 
 def shift_range_bins(raw: np.ndarray, shift: int) -> np.ndarray:
     """
@@ -39,51 +60,48 @@ def synthesize_sample(raw: np.ndarray, is_empty: bool = False) -> np.ndarray:
 
     if is_empty:
         # For 0_people (empty room):
-        # 1. Temporal rolling
-        roll_t = random.randint(0, num_frames - 1)
-        out = np.roll(out, roll_t, axis=0)
-
-        # 2. Slight amplitude jitter
+        # 1. Slight amplitude jitter
         amp_scale = np.random.uniform(0.85, 1.15, size=(1, num_sensors, 1, 1, 1))
         out = out * amp_scale
 
-        # 3. Base complex phase jitter
+        # 2. Base complex phase jitter (constant per channel; MTI-invariant)
         phase_jitter = np.exp(1j * np.random.uniform(0, 2 * np.pi, size=(1, num_sensors, num_tx, num_rx, 1)))
         out = out * phase_jitter
 
-        # 4. Thermal noise addition
-        noise_level = np.std(out) * 0.05
-        noise = (np.random.randn(*out.shape) + 1j * np.random.randn(*out.shape)) * noise_level
-        out = out + noise.astype(np.complex64)
-        return out
+        # 3. Thermal noise sized against the MTI residual, not the raw signal
+        sigma = mti_noise_scale(out, 0.05)
+        out = out + complex_gaussian_noise(out.shape, sigma)
+        return out.astype(np.complex64)
 
-    # For 1_people, 2_people, 3_people:
-    # 1. Range bin shift (distance variation +/- 15 bins ~ 10cm steps)
-    range_shift = random.randint(-15, 15)
+    # For occupied rooms (1..N people):
+    # 1. Range bin shift (distance variation; BIN_LENGTH_M metres per bin)
+    range_shift = random.randint(-MAX_RANGE_SHIFT_BINS, MAX_RANGE_SHIFT_BINS)
     out = shift_range_bins(out, range_shift)
 
-    # 2. Temporal rolling (continuous breathing cycle shift)
-    roll_t = random.randint(0, num_frames - 1)
-    out = np.roll(out, roll_t, axis=0)
-
-    # 3. Amplitude scaling (body size / clothing reflection)
-    global_scale = np.random.uniform(0.75, 1.35)
+    # 2. Amplitude scaling (body size / clothing reflection). Applied per sensor
+    #    only -- a GLOBAL rescale would move the very absolute-energy cue that
+    #    separates the occupancy classes, so it is deliberately omitted.
     sensor_imbalance = np.random.uniform(0.88, 1.12, size=(1, num_sensors, 1, 1, 1))
-    out = out * (global_scale * sensor_imbalance)
+    out = out * sensor_imbalance
 
-    # 4. Complex phase rotation & breathing micro-Doppler modulation
+    # 3. Complex phase rotation & breathing micro-Doppler modulation.
+    #    A random phase OFFSET replaces the previous np.roll: rolling wrapped the
+    #    breathing waveform discontinuously across the window edge, injecting a
+    #    non-physical step that MTI turns into a broadband transient.
     t_idx = np.arange(num_frames).reshape(num_frames, 1, 1, 1, 1)
-    breath_freq = np.random.uniform(0.18, 0.45) # ~11 to 27 breaths/min
-    breath_depth = np.random.uniform(0.05, 0.25) # radian phase modulation
+    breath_freq = np.random.uniform(0.18, 0.45)   # ~11 to 27 breaths/min
+    breath_depth = np.random.uniform(0.05, 0.25)  # radian phase modulation
+    breath_phase0 = np.random.uniform(0, 2 * np.pi)
     phase_rot = np.random.uniform(0, 2 * np.pi, size=(1, num_sensors, num_tx, num_rx, 1))
-    
-    total_phase = phase_rot + breath_depth * np.sin(2 * np.pi * breath_freq * (t_idx / 10.0))
+
+    total_phase = phase_rot + breath_depth * np.sin(
+        2 * np.pi * breath_freq * (t_idx / FRAME_RATE_HZ) + breath_phase0
+    )
     out = out * np.exp(1j * total_phase)
 
-    # 5. Additive Gaussian noise
-    noise_level = np.std(out) * 0.04
-    noise = (np.random.randn(*out.shape) + 1j * np.random.randn(*out.shape)) * noise_level
-    out = out + noise.astype(np.complex64)
+    # 4. Additive Gaussian noise sized against the MTI residual
+    sigma = mti_noise_scale(out, 0.04)
+    out = out + complex_gaussian_noise(out.shape, sigma)
 
     return out.astype(np.complex64)
 
@@ -114,7 +132,29 @@ def run(args):
 
     for cdir in class_dirs:
         cname = cdir.name
-        files = sorted(list(cdir.glob("*.npy")))
+        files = []
+        rejected = []
+        for fp in sorted(cdir.glob("*.npy")):
+            try:
+                shape = np.load(fp, mmap_mode="r").shape
+            except Exception as exc:
+                rejected.append((fp.name, f"unreadable: {exc}"))
+                continue
+            # Expect (Frames, Sensors, TX, RX, Bins)
+            if len(shape) != 5 or shape[1] != 2 or shape[2] != 2 or shape[3] != 2:
+                rejected.append((fp.name, f"bad shape {shape}, expected (F, 2, 2, 2, B)"))
+                continue
+            files.append(fp)
+
+        if rejected:
+            print(f"\n[WARN] {cname}: rejecting {len(rejected)} malformed recording(s):")
+            for name, why in rejected:
+                print(f"         - {name}: {why}")
+
+        if not files:
+            print(f"[ERROR] {cname}: no valid recordings, skipping class.")
+            continue
+
         random.shuffle(files)
 
         n_total = len(files)
@@ -124,16 +164,19 @@ def run(args):
 
         print(f"\n[{cname}] Total: {n_total} | Holdout: {len(holdout_files)} | Base Train: {len(train_files)}")
 
-        # 1. Save Holdout Real Files
+        # 1. Save Holdout Real Files.
+        #    Existing files are purged first so repeated runs are idempotent --
+        #    previously a re-run only topped up to target_per_class and left
+        #    stale samples behind, silently oversampling that class.
         c_holdout_dir = holdout_root / cname
-        c_holdout_dir.mkdir(parents=True, exist_ok=True)
+        _reset_dir(c_holdout_dir)
         for hf in holdout_files:
             data = np.load(hf)
             np.save(c_holdout_dir / hf.name, data)
 
         # 2. Save Real Train Files
         c_train_dir = train_root / cname
-        c_train_dir.mkdir(parents=True, exist_ok=True)
+        _reset_dir(c_train_dir)
         for tf in train_files:
             data = np.load(tf)
             np.save(c_train_dir / tf.name, data)

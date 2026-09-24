@@ -17,4 +17,6 @@ RadarDirectInstall/
 lib/
 LibFT4222-v1.4.5
 X7_SDK_0.6_x64-win/
-human_dataset_2s_augmented/
+human_dataset_v2/
+backup*/
+debug_captures/

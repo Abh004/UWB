@@ -1,5 +1,30 @@
+"""
+x7_2s_record_presence.py
+========================
+Dual-radar human presence / occupancy recorder.
+
+Records 5-second dual-sensor windows for a chosen occupancy count AND a chosen
+seating arrangement, then loops through every requested scenario automatically.
+
+Scenario ORDER matters as much as the data. The v2 dataset recorded one
+occupancy level per day, which made "how many people" perfectly predictable
+from the day's noise floor: a classifier fed only bins beyond 3.55 m -- where
+no seat exists -- still scored 99.7%. It had learnt the date, not the
+occupants. This recorder therefore interleaves: a session runs in ROUNDS, and
+every round visits every scenario once in reshuffled order, so drift in gain,
+temperature or clutter spreads across all classes instead of encoding them.
+
+Range: the stock human_preset.json already reaches 6.55 m. The bin count and
+bin length are DETECTED from the radar at run time rather than hardcoded --
+earlier revisions assumed a fixed count and silently zero-padded when the radar
+disagreed, and assumed a bin length that was wrong by a factor of 11.
+
+Usage:
+    python x7_2s_record_presence.py --host1 529 --host2 545 --seats 4
+"""
+
 import os
-os.add_dll_directory(r"C:\RR_02\bin") 
+os.add_dll_directory(r"C:\RR_02\bin")
 
 import sys
 import json
@@ -8,10 +33,11 @@ import argparse
 import time
 import threading
 import queue
+import itertools
+import random
 from pathlib import Path
 import numpy as np
 
-# Suppress warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 _DEMO_DIR = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback"
@@ -23,44 +49,79 @@ for path in [_DEMO_PARENT, _DEMO_DIR]:
 from radar_direct_callback import RadarDirectCallback
 
 # ── CONFIG ──────────────────────────────────────────────────────────────
-RANGE_BINS = 339    # Increased to 339 bins (~2.2 meters at 6.5mm/bin)
-RADAR_FPS  = 10   
-SYNC_TOLERANCE = 0.1  # seconds
+# Frame rate is a TRADE, not a free parameter.
+#
+# Breathing is 0.20-0.33 Hz, so Nyquist needs only ~0.66 Hz -- 10 FPS is about
+# 15x more than the signal requires. At 3 m the return is ~25 dB weaker than at
+# 0.72 m (R^4), so SNR is the binding constraint, and surplus frame rate is
+# exactly what you spend to buy integration back.
+#
+# Lowering FPS also lengthens the observation window for the same frame count.
+# At 10 FPS a 50-frame window holds barely ONE breath cycle (1.0-1.7), which is
+# too few to establish periodicity; at 5 FPS it holds 2.0-3.3.
+#
+# 5 FPS keeps Nyquist at 2.5 Hz, above heart rate (1.0-1.7 Hz), so respiration
+# and pulse both stay accessible.
+DEFAULT_FPS = 5
+DEFAULT_SECONDS = 10.0
+
+# Integration is scaled to hold the frame-time budget constant as FPS drops:
+#     IterationsPerFrame = BASE_ITERATIONS * (BASE_FPS / fps)
+BASE_FPS = 10
+BASE_ITERATIONS = 700
+
+SYNC_TOLERANCE = 0.1          # informational only; pairing is by sequence number
+
+# Measured from the SDK (probe_range.py), not assumed. Imported so there is a
+# single source of truth.
+from x7_physics import BIN_LENGTH_M, RANGE_OFFSET_M
+
+DEFAULT_PRESET = (r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect"
+                  r"\X7RadarDirectCallback\Presets\human_preset.json")
+
+# Measured on 2026-09-10: the stock preset returns 112 bins spanning
+# -1.38 m .. 6.55 m. This is the EXPECTED value only; the recorder allocates
+# from whatever the radar actually sends (see _ensure_alloc) and warns on
+# mismatch. Raising MframesPerPulse to extend range does NOT work -- every
+# preset shipped with the SDK uses 7 and the radar silently refuses others.
+RANGE_BINS = 112
+
+# x7_2s_live_presence imports this name.
+RADAR_FPS = DEFAULT_FPS
+
 
 # ── RADAR SOURCE ────────────────────────────────────────────────────────
 class X7DualRadar:
-    def __init__(self, host1, host2, preset_json_path=None):
+    def __init__(self, host1, host2, preset_json_path=None, fps=DEFAULT_FPS):
+        self.fps = fps
         self.frame_queue = queue.Queue(maxsize=400)
-        self.range_bins = RANGE_BINS
-        if preset_json_path is None:
-            preset_json_path = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback\Presets\human_preset.json"
-        
-        self.host1 = host1
-        self.host2 = host2
-        
-        # Virtual frames for assembling TX0 and TX1 (TX, RX, BINS)
-        self.virtual_frame1 = np.zeros((2, 2, self.range_bins), dtype=np.complex64)
+        self.range_bins = None            # detected from the first frame
+        self._alloc_lock = threading.Lock()
+        self.virtual_frame1 = None
+        self.virtual_frame2 = None
         self.last_tx_data1 = [False, False]
-        self.virtual_frame2 = np.zeros((2, 2, self.range_bins), dtype=np.complex64)
         self.last_tx_data2 = [False, False]
-        
-        # Buffer for software synchronization
+
+        if preset_json_path is None:
+            preset_json_path = DEFAULT_PRESET
+
+        self.host1, self.host2 = host1, host2
         self.buffer_lock = threading.Lock()
-        self.buffer1 = {} # seq_num -> frame
-        self.buffer2 = {} # seq_num -> frame
-        
+        self.buffer1 = {}                 # seq -> (frame, timestamp)
+        self.buffer2 = {}
+        self.last_pair_skew = 0
+
         self.runner1 = RadarDirectCallback()
         self.runner2 = RadarDirectCallback()
-        
-        # Create custom presets with Host IDs
         self.preset1_path = self._create_port_preset(preset_json_path, host1)
         self.preset2_path = self._create_port_preset(preset_json_path, host2)
-        
-        self._thread1 = threading.Thread(target=self.runner1.run_with_callback_preset, 
-                                        args=(self._frame_callback1, self.preset1_path), daemon=True)
-        self._thread2 = threading.Thread(target=self.runner2.run_with_callback_preset, 
-                                        args=(self._frame_callback2, self.preset2_path), daemon=True)
-        
+
+        self._thread1 = threading.Thread(
+            target=self.runner1.run_with_callback_preset,
+            args=(self._frame_callback1, self.preset1_path), daemon=True)
+        self._thread2 = threading.Thread(
+            target=self.runner2.run_with_callback_preset,
+            args=(self._frame_callback2, self.preset2_path), daemon=True)
         self._thread1.start()
         print(f"[INFO] Sensor 1 (Host {host1}) stream started.")
         self._thread2.start()
@@ -69,198 +130,317 @@ class X7DualRadar:
     def _create_port_preset(self, base_preset, host_id):
         with open(base_preset, 'r') as f:
             preset = json.load(f)
-        
-        if "ConnectionParameters" not in preset:
-            preset["ConnectionParameters"] = {}
+        preset.setdefault("ConnectionParameters", {})
         preset["ConnectionParameters"]["HostInterfaceId"] = str(host_id)
-        
-        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
-        json.dump(preset, temp_file)
-        temp_file.close()
-        return temp_file.name
+        # FPS and integration are set together so they cannot drift apart.
+        rs = preset.setdefault("RadarSource", {})
+        rs["FPS"] = f"{float(self.fps):.1f}"
+        rs["IterationsPerFrame"] = str(int(BASE_ITERATIONS * BASE_FPS / self.fps))
+        tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        json.dump(preset, tmp)
+        tmp.close()
+        return tmp.name
 
-    def _process_assembled_frame(self, frame, seq_num, sensor_idx):
+    def _ensure_alloc(self, n_bins):
+        """Size the virtual frames from the first frame the radar actually sends."""
+        with self._alloc_lock:
+            if self.range_bins is None:
+                self.range_bins = int(n_bins)
+                self.virtual_frame1 = np.zeros((2, 2, self.range_bins), dtype=np.complex64)
+                self.virtual_frame2 = np.zeros((2, 2, self.range_bins), dtype=np.complex64)
+                far = RANGE_OFFSET_M + (self.range_bins - 1) * BIN_LENGTH_M
+                print(f"\n[INFO] Radar returned {self.range_bins} range bins -> "
+                      f"{RANGE_OFFSET_M:+.2f} m .. {far:+.2f} m")
+                if self.range_bins != RANGE_BINS:
+                    print(f"[WARN] Expected {RANGE_BINS} bins. Recording is still "
+                          f"valid, but tell whoever trains on it.")
+
+    def _process_assembled_frame(self, frame, seq_num, sensor_idx, timestamp):
         with self.buffer_lock:
-            if sensor_idx == 1:
-                self.buffer1[seq_num] = frame
-            else:
-                self.buffer2[seq_num] = frame
-                
-            # Try to synchronize
-            matched_seq = None
-            search_window = 10
-            for offset in range(-search_window, search_window + 1):
-                target_seq = seq_num + offset
-                if target_seq in self.buffer1 and target_seq in self.buffer2:
-                    matched_seq = target_seq
+            (self.buffer1 if sensor_idx == 1 else self.buffer2)[seq_num] = (frame, timestamp)
+            matched = None
+            for off in range(-10, 11):
+                t = seq_num + off
+                if t in self.buffer1 and t in self.buffer2:
+                    matched = t
+                    self.last_pair_skew = abs(self.buffer1[t][1] - self.buffer2[t][1])
                     break
-                    
-            if matched_seq is not None:
-                # Stack to shape (2 Sensors, 2 TX, 2 RX, Bins)
-                combined_frame = np.stack([self.buffer1[matched_seq], self.buffer2[matched_seq]], axis=0)
-                # Clean up older frames
-                keys1 = list(self.buffer1.keys())
-                keys2 = list(self.buffer2.keys())
-                for k in keys1:
-                    if k <= matched_seq: del self.buffer1[k]
-                for k in keys2:
-                    if k <= matched_seq: del self.buffer2[k]
-                    
-                if not self.frame_queue.full():
-                    self.frame_queue.put(combined_frame)
+            if matched is None:
+                return
+            combined = np.stack([self.buffer1[matched][0], self.buffer2[matched][0]], axis=0)
+            for k in [k for k in self.buffer1 if k <= matched]:
+                del self.buffer1[k]
+            for k in [k for k in self.buffer2 if k <= matched]:
+                del self.buffer2[k]
+            if not self.frame_queue.full():
+                self.frame_queue.put(combined)
+
+    def _callback(self, trx_mask, data, seq_num, timestamp, sensor_idx):
+        try:
+            tx_idx = int(trx_mask[1])
+            radar_data = np.asarray(data, dtype=np.float32)
+            self._ensure_alloc(radar_data.shape[2])
+            if radar_data.shape[2] > self.range_bins:
+                radar_data = radar_data[:, :, :self.range_bins]
+            complex_data = (radar_data[:, 0, :] + 1j * radar_data[:, 1, :]).astype(np.complex64)
+            if complex_data.shape[1] < self.range_bins:
+                return True                      # short frame: drop, never pad
+            vf = self.virtual_frame1 if sensor_idx == 1 else self.virtual_frame2
+            flags = self.last_tx_data1 if sensor_idx == 1 else self.last_tx_data2
+            vf[tx_idx, :, :] = complex_data
+            flags[tx_idx] = True
+            if all(flags):
+                self._process_assembled_frame(vf.copy(), seq_num, sensor_idx, timestamp)
+                flags[0] = flags[1] = False
+        except Exception:
+            pass
+        return True
 
     def _frame_callback1(self, trx_mask, data, seq_num, timestamp, range_offset, bin_length):
-        try:
-            tx_idx = int(trx_mask[1])
-            radar_data = np.asarray(data, dtype=np.float32)
-            if radar_data.shape[2] > self.range_bins:
-                radar_data = radar_data[:, :, :self.range_bins]
-                
-            complex_data = (radar_data[:, 0, :] + 1j * radar_data[:, 1, :]).astype(np.complex64)
-            
-            # Pad with zeros if the hardware returned fewer bins than requested
-            if complex_data.shape[1] < self.range_bins:
-                pad_width = self.range_bins - complex_data.shape[1]
-                complex_data = np.pad(complex_data, ((0, 0), (0, pad_width)), 'constant')
-                
-            self.virtual_frame1[tx_idx, :, :] = complex_data
-            self.last_tx_data1[tx_idx] = True
-            
-            if all(self.last_tx_data1):
-                self._process_assembled_frame(self.virtual_frame1.copy(), seq_num, 1)
-                self.last_tx_data1 = [False, False]
-        except Exception as e:
-            pass
-        return True
+        return self._callback(trx_mask, data, seq_num, timestamp, 1)
 
     def _frame_callback2(self, trx_mask, data, seq_num, timestamp, range_offset, bin_length):
-        try:
-            tx_idx = int(trx_mask[1])
-            radar_data = np.asarray(data, dtype=np.float32)
-            if radar_data.shape[2] > self.range_bins:
-                radar_data = radar_data[:, :, :self.range_bins]
-                
-            complex_data = (radar_data[:, 0, :] + 1j * radar_data[:, 1, :]).astype(np.complex64)
-            
-            # Pad with zeros if the hardware returned fewer bins than requested
-            if complex_data.shape[1] < self.range_bins:
-                pad_width = self.range_bins - complex_data.shape[1]
-                complex_data = np.pad(complex_data, ((0, 0), (0, pad_width)), 'constant')
-                
-            self.virtual_frame2[tx_idx, :, :] = complex_data
-            self.last_tx_data2[tx_idx] = True
-            
-            if all(self.last_tx_data2):
-                self._process_assembled_frame(self.virtual_frame2.copy(), seq_num, 2)
-                self.last_tx_data2 = [False, False]
-        except Exception as e:
-            pass
-        return True
+        return self._callback(trx_mask, data, seq_num, timestamp, 2)
 
     def get_frame(self):
-        try: return self.frame_queue.get(timeout=2.0)
-        except queue.Empty: return None
+        try:
+            return self.frame_queue.get(timeout=2.0)
+        except queue.Empty:
+            return None
 
     def flush_queue(self):
         while not self.frame_queue.empty():
-            try: self.frame_queue.get_nowait()
-            except: break
+            try:
+                self.frame_queue.get_nowait()
+            except Exception:
+                break
 
-    def close(self): 
-        try:
-            os.remove(self.preset1_path)
-            os.remove(self.preset2_path)
-        except:
-            pass
+    def close(self):
+        for p in (self.preset1_path, self.preset2_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
         print("[INFO] X7 dual radar closed.")
 
-# ── RECORDING LOGIC ─────────────────────────────────────────────────────
+
+# ── RECORDING ───────────────────────────────────────────────────────────
 def record_trial(radar, duration_s, label):
-    time.sleep(1.0)
-    
-    # Empty the buffer right before recording so we don't grab old frames
     radar.flush_queue()
-    
-    n_frames = int(duration_s * RADAR_FPS)
-    # Shape: (Frames, 2 Sensors, 2 TX, 2 RX, Bins)
-    frames = np.zeros((n_frames, 2, 2, 2, RANGE_BINS), dtype=np.complex64)
+    n_frames = int(duration_s * radar.fps)
+    frames = None
     collected = 0
-    print(f"\n  ▶ Recording '{label}' for {duration_s} seconds...", end="")
     while collected < n_frames:
-        frame = radar.get_frame() 
-        if frame is not None:
-            frames[collected] = frame
-            collected += 1
-            if collected % 5 == 0:
-                print(f"\r  ▶ Recording '{label}' ... {collected}/{n_frames}", end="", flush=True)
-        else:
-            print(f"\n[WARN] Timeout: No combined frame received. Check synchronization.", end="", flush=True)
+        frame = radar.get_frame()
+        if frame is None:
+            print("\n[WARN] Timeout waiting for a synchronised frame pair.")
             break
-    print("\n  ▶ Recording complete!")
-    return frames[:collected]
+        if frames is None:
+            frames = np.zeros((n_frames,) + frame.shape, dtype=np.complex64)
+        frames[collected] = frame
+        collected += 1
+        bar = "#" * int(20 * collected / n_frames)
+        sys.stdout.write(f"\r    recording {label}  [{bar:<20}] {collected}/{n_frames}")
+        sys.stdout.flush()
+    print()
+    return frames[:collected] if frames is not None else np.empty(0)
 
-def run_presence(args, radar):
-    print("\n" + "="*50)
-    print("Starting dual-sensor human presence recording session...")
-    
-    print("\nSelect Occupancy:")
-    print("  [0] - Empty")
-    print("  [1] - 1 Person")
-    print("  [2] - 2 People")
-    print("  [3] - 3 People")
-    print("  [4] - 4 People")
-    print("  [5] - 5 People")
-    print("  [q] - Quit")
-    occ_choice = input("Enter choice (0-5, q): ").strip().lower()
-    
-    if occ_choice == 'q':
-        return False
-        
-    if occ_choice not in ["0", "1", "2", "3", "4", "5"]:
-        print("Invalid choice. Defaulting to 1 Person.")
-        occ_choice = "1"
-        
-    occ_str = f"{occ_choice}_people"
-    
-    subject_id = input("\nEnter Subject ID (e.g. S01): ").strip()
-    if not subject_id:
-        subject_id = "unknown"
-        
-    trials_str = input("Enter number of trials to record [default 1]: ").strip()
+
+def seat_scenarios(n_seats, n_people):
+    """All distinct seat combinations for a given occupancy."""
+    if n_people == 0:
+        return [()]
+    return list(itertools.combinations(range(1, n_seats + 1), n_people))
+
+
+def build_plan(n_seats):
+    """Ask what to record and return a list of (n_people, seats) scenarios."""
+    print("\n" + "=" * 62)
+    print(" SESSION PLAN")
+    print("=" * 62)
+    print(f" Seats available: {n_seats}  (numbered 1..{n_seats})")
+
+    raw = input(f"\n Which occupancy levels? (e.g. 0,1,2,3  or 'all') [all]: ").strip().lower()
+    if raw in ("", "all"):
+        levels = list(range(0, n_seats + 1))
+    else:
+        try:
+            levels = sorted({int(x) for x in raw.replace(" ", "").split(",")})
+        except ValueError:
+            print(" Could not parse, using all.")
+            levels = list(range(0, n_seats + 1))
+    levels = [l for l in levels if 0 <= l <= n_seats]
+
+    plan = []
+    for k in levels:
+        combos = seat_scenarios(n_seats, k)
+        if k == 0:
+            plan.append((0, ()))
+            continue
+        print(f"\n {k} person(s) -- {len(combos)} possible seat arrangement(s):")
+        for i, c in enumerate(combos, 1):
+            print(f"   [{i}] seats {','.join(map(str, c))}")
+        sel = input(f" Which arrangements? (e.g. 1,3  or 'all') [all]: ").strip().lower()
+        if sel in ("", "all"):
+            chosen = combos
+        else:
+            try:
+                idx = {int(x) for x in sel.replace(" ", "").split(",")}
+                chosen = [combos[i - 1] for i in sorted(idx) if 1 <= i <= len(combos)]
+            except (ValueError, IndexError):
+                print(" Could not parse, using all.")
+                chosen = combos
+        plan += [(k, c) for c in chosen]
+    return plan
+
+
+def scenario_tag(n_people, seats):
+    return "empty" if n_people == 0 else "seats" + "".join(map(str, seats))
+
+
+def run_session(args, radar):
+    plan = build_plan(args.seats)
+    if not plan:
+        print("Nothing selected.")
+        return
+
+    subject = input("\n Subject / session ID (e.g. S01): ").strip() or "S01"
     try:
-        n_trials = int(trials_str)
+        trials = int(input(f" Trials per scenario [{args.trials}]: ").strip() or args.trials)
     except ValueError:
-        n_trials = 1
-        
-    duration_s = 5.0
-    
-    desc = f"{occ_choice} People"
-    out_dir = Path(args.out) / occ_str
-    out_dir.mkdir(parents=True, exist_ok=True)
-        
-    for i in range(n_trials):
-        print(f"\n--- Trial {i+1} of {n_trials} ---")
-        data = record_trial(radar, duration_s, desc)
-        if len(data) > 0:
-            filename = f"subject_{subject_id}_{int(time.time())}_{i+1}.npy"
-            np.save(out_dir / filename, data)
-            print(f"\nSaved {len(data)} dual-sensor frames to {out_dir / filename}")
-    return True
+        trials = args.trials
 
-# ── ENTRY POINT ─────────────────────────────────────────────────────────
+    block = max(1, min(args.block, trials))
+    n_rounds = (trials + block - 1) // block
+    total = len(plan) * trials
+
+    # Tag every file with the sitting it came from, so the confound check is
+    # exact instead of inferred from timestamp gaps.
+    sitting = time.strftime("%m%d%H%M")
+    subj_field = f"{subject}-{sitting}"
+
+    print("\n" + "=" * 62)
+    print(f" {len(plan)} scenario(s) x {trials} trial(s) = {total} recordings")
+    print(f" interleaved: {n_rounds} round(s), {block} back-to-back trial(s) per visit")
+    print(f" {args.seconds:.0f}s each -> about {total * (args.seconds + 4) / 60:.0f} min")
+    print(f" sitting id {sitting}")
+    if len({k for k, _ in plan}) < 2:
+        print("\n [WARNING] only one occupancy level in this session. Recording a")
+        print("           single level per sitting is what confounded the v2 data:")
+        print("           the model learns the day, not the people. Include every")
+        print("           level in every sitting unless you are topping up.")
+    print("=" * 62)
+
+    out_root = Path(args.out)
+    done = 0
+    remaining = {sc: trials for sc in plan}
+
+    for rnd in range(n_rounds):
+        order = [sc for sc in plan if remaining[sc] > 0]
+        random.shuffle(order)
+        print("\n" + "=" * 62)
+        print(f" ROUND {rnd + 1}/{n_rounds}   ({len(order)} scenario(s) this round)")
+        print("=" * 62)
+
+        for n_people, seats in order:
+            sc = (n_people, seats)
+            tag = scenario_tag(n_people, seats)
+            k = min(block, remaining[sc])
+            where = "EMPTY -- everyone out of the cabin" if n_people == 0 else \
+                    f"{n_people} person(s) in seat(s) {','.join(map(str, seats))}"
+            print("\n" + "-" * 62)
+            print(f" SCENARIO: {where}")
+            print(f" round {rnd + 1}/{n_rounds}, {k} trial(s) now, "
+                  f"{remaining[sc]} of {trials} left overall")
+            print("-" * 62)
+            ans = input(" Position everyone, then press Enter "
+                        "('s' skip this visit, 'q' end session): ").strip().lower()
+            if ans == "q":
+                print(" ending session early.")
+                remaining = {x: 0 for x in remaining}
+                break
+            if ans == "s":
+                print(" skipped.")
+                continue
+
+            out_dir = out_root / f"{n_people}_people"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # An empty-cabin trial needs everyone clear of the radar, the
+            # operator included, so it gets a longer countdown.
+            cd = args.countdown_empty if n_people == 0 else args.countdown
+            for t in range(k):
+                idx = trials - remaining[sc] + 1
+                print(f"  trial {idx}/{trials}")
+                for c in range(cd, 0, -1):
+                    sys.stdout.write(f"\r    starting in {c}...  ")
+                    sys.stdout.flush()
+                    time.sleep(1.0)
+                sys.stdout.write("\r" + " " * 30 + "\r")
+                data = record_trial(radar, args.seconds, tag)
+                if len(data) == 0:
+                    print("    no data, skipping.")
+                    continue
+                fn = (f"{n_people}people_{tag}_{subj_field}_"
+                      f"{int(time.time())}_{idx:03d}.npy")
+                np.save(out_dir / fn, data)
+                remaining[sc] -= 1
+                done += 1
+                print(f"    saved {fn}   ({done}/{total})")
+
+        if not any(remaining.values()):
+            break
+
+    print("\n" + "=" * 62)
+    print(f" Session complete: {done} recordings under {out_root}/  (sitting {sitting})")
+    print("=" * 62)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host1", required=True, help="HostInterfaceId for Sensor 1 (e.g. 529)")
-    parser.add_argument("--host2", required=True, help="HostInterfaceId for Sensor 2 (e.g. 545)")
-    parser.add_argument("--out", default="human_dataset_2s", help="Output directory")
+    parser = argparse.ArgumentParser(description="Dual-radar occupancy recorder")
+    parser.add_argument("--host1", required=True, help="HostInterfaceId for Sensor 1")
+    parser.add_argument("--host2", required=True, help="HostInterfaceId for Sensor 2")
+    parser.add_argument("--out", default="human_dataset_v2", help="Output directory")
+    parser.add_argument("--seats", type=int, default=4, help="Number of seats (default 4)")
+    parser.add_argument("--trials", type=int, default=10, help="Default trials per scenario")
+    parser.add_argument("--countdown", type=int, default=3,
+                        help="Countdown seconds before each trial (default 3)")
+    parser.add_argument("--countdown-empty", dest="countdown_empty", type=int,
+                        default=15,
+                        help="Countdown before an EMPTY-cabin trial (default "
+                             "15). Everyone must be clear of the radar, the "
+                             "operator included, so 3 s is not enough.")
+    parser.add_argument("--block", type=int, default=5,
+                        help="Back-to-back trials per scenario visit (default 5). The "
+                             "session repeats in rounds until every scenario has its "
+                             "full trial count, reshuffling order each round, so no "
+                             "occupancy level is confined to one part of the sitting.")
+    parser.add_argument("--preset", default=None, help="Override the radar preset")
+    parser.add_argument("--fps", type=float, default=DEFAULT_FPS,
+                        help=f"Radar frame rate (default {DEFAULT_FPS}). Lower FPS buys "
+                             "integration and a longer breathing window.")
+    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS,
+                        help=f"Seconds per trial (default {DEFAULT_SECONDS})")
     args = parser.parse_args()
 
-    radar = X7DualRadar(args.host1, args.host2)
+    iters = int(BASE_ITERATIONS * BASE_FPS / args.fps)
+    print(f"[INFO] {args.fps:g} FPS, {iters} iterations/frame "
+          f"({10 * np.log10(iters / BASE_ITERATIONS):+.1f} dB vs {BASE_FPS} FPS)")
+    print(f"[INFO] {args.seconds:g}s trials -> {int(args.seconds * args.fps)} frames, "
+          f"{args.seconds * 0.20:.1f}-{args.seconds * 0.33:.1f} breath cycles per window")
+
+    # An orphaned live-inference worker holds the radar exclusively and makes
+    # this fail with a misleading "check the DCNF0/1 jumpers" message.
     try:
-        while True:
-            if not run_presence(args, radar):
-                break
-    except KeyboardInterrupt:
+        from x7_acq_worker import clear_stale_workers
+        clear_stale_workers()
+    except Exception:
         pass
+
+    radar = X7DualRadar(args.host1, args.host2, preset_json_path=args.preset, fps=args.fps)
+    try:
+        time.sleep(2.0)
+        run_session(args, radar)
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted.")
     finally:
         radar.close()
