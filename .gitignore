@@ -17,13 +17,14 @@ RadarDirectInstall/
 lib/
 LibFT4222-v1.4.5
 X7_SDK_0.6_x64-win/
-human*/
+human_dataset_v2/
 backup*/
 debug_captures/
 paper/
-gesture*/
+gesture_live*/
+gesture_dataset_enter_style/
 live*/
-models/
 direction*/
 X7F202*
 selftest*/
+.remember/
