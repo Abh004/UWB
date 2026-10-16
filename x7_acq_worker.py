@@ -82,8 +82,26 @@ def _parent_watchdog(parent_pid, stop_evt, radar_box):
             os._exit(0)          # hard exit: the SDK will not unwind cleanly
 
 
+def _make_gesture_radar(host1, host2):
+    """Gesture radar (default_preset.json, 40 FPS) that also records the range
+    map the SDK reports on the first frame."""
+    from x7_2s_record import X7DualRadar as _G
+
+    class _Probed(_G):
+        range_info = None
+
+        def _frame_callback1(self, trx_mask, data, seq_num, timestamp, range_offset, bin_length):
+            if self.range_info is None:
+                self.range_info = (float(range_offset), float(bin_length),
+                                   int(np.asarray(data).shape[2]))
+            return super()._frame_callback1(trx_mask, data, seq_num, timestamp,
+                                            range_offset, bin_length)
+
+    return _Probed(host1, host2)
+
+
 def _worker(host1, host2, fps, preset, out_q, stop_evt, ready_evt, err_q,
-            parent_pid=None):
+            parent_pid=None, kind="presence", info_q=None):
     """Child process: own the radar, forward frames, keep Python work minimal."""
     radar_box = {"radar": None}
     if parent_pid is not None:
@@ -91,8 +109,13 @@ def _worker(host1, host2, fps, preset, out_q, stop_evt, ready_evt, err_q,
                          args=(parent_pid, stop_evt, radar_box),
                          daemon=True).start()
     try:
-        from x7_2s_record_presence import X7DualRadar
-        radar = X7DualRadar(host1, host2, preset_json_path=preset, fps=fps)
+        if kind == "gesture":
+            radar = _make_gesture_radar(host1, host2)
+            time.sleep(2.0)
+            radar.flush_queue()
+        else:
+            from x7_2s_record_presence import X7DualRadar
+            radar = X7DualRadar(host1, host2, preset_json_path=preset, fps=fps)
         radar_box["radar"] = radar
     except Exception as exc:                      # surface init failures upstream
         try:
@@ -102,11 +125,15 @@ def _worker(host1, host2, fps, preset, out_q, stop_evt, ready_evt, err_q,
         return
 
     ready_evt.set()
+    sent_info = False
     try:
         while not stop_evt.is_set():
             frame = radar.get_frame()
             if frame is None:
                 continue
+            if not sent_info and info_q is not None and getattr(radar, "range_info", None):
+                info_q.put(radar.range_info)
+                sent_info = True
             try:
                 # Drop rather than block: a stalled consumer must not push
                 # back into the SDK callback thread.
@@ -151,6 +178,25 @@ def find_stale_workers():
     return out
 
 
+def radar_usb_interfaces():
+    """Number of FT4222H USB interfaces Windows currently sees (2 per board,
+    4 for the dual radar), or None if it cannot be checked.
+
+    The SDK reports an unplugged board with the same misleading "check the
+    DCNF0/1 jumpers" message as a locked one, so check presence first.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.FriendlyName -match 'FT4222' }).Count"],
+            capture_output=True, text=True, timeout=20)
+        return int(out.stdout.strip() or 0)
+    except Exception:
+        return None
+
+
 def clear_stale_workers(verbose=True):
     """Kill orphaned workers. Returns (killed, still_wedged).
 
@@ -158,6 +204,11 @@ def clear_stale_workers(verbose=True):
     zombie that still holds the device; that one needs a USB replug.
     """
     import subprocess
+    n_usb = radar_usb_interfaces()
+    if verbose and n_usb is not None and n_usb < 4:
+        print(f"[ERROR] radar USB: only {n_usb} of 4 FT4222H interfaces are connected.\n"
+              f"        A board is unplugged, unpowered or its USB hub dropped out --\n"
+              f"        reconnect it. (The SDK will blame the DCNF0/1 jumpers; ignore that.)")
     stale = find_stale_workers()
     killed, wedged = [], []
     for pid, ppid in stale:
@@ -189,22 +240,36 @@ def clear_stale_workers(verbose=True):
 class RadarProcess:
     """Same get_frame()/close() shape as X7DualRadar, but out of process."""
 
-    def __init__(self, host1, host2, fps=None, preset=None, maxsize=200):
-        if fps is None:
+    def __init__(self, host1, host2, fps=None, preset=None, maxsize=200, kind="presence"):
+        """kind="presence": human_preset at `fps` (default 5 FPS).
+        kind="gesture":  default_preset.json at 40 FPS (x7_2s_record.X7DualRadar)."""
+        if fps is None and kind == "presence":
             from x7_2s_record_presence import DEFAULT_FPS
             fps = DEFAULT_FPS
         ctx = mp.get_context("spawn")
         self._q = ctx.Queue(maxsize=maxsize)
         self._err = ctx.Queue()
+        self._info = ctx.Queue()
+        self._range_info = None
         self._stop = ctx.Event()
         self._ready = ctx.Event()
         self._proc = ctx.Process(
             target=_worker,
             args=(host1, host2, fps, preset, self._q, self._stop,
-                  self._ready, self._err, os.getpid()),
+                  self._ready, self._err, os.getpid(), kind, self._info),
             daemon=True,
         )
         self._proc.start()
+
+    @property
+    def range_info(self):
+        """(range_offset m, bin_length m, bins delivered), once the first frame arrived."""
+        if self._range_info is None:
+            try:
+                self._range_info = self._info.get_nowait()
+            except Exception:
+                pass
+        return self._range_info
 
     def wait_ready(self, timeout=60.0):
         """True once the child has both sensors streaming."""

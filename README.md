@@ -1,222 +1,438 @@
 # Dual-Sensor IR-UWB Radar Intelligence System
-### High-Precision 3D Gesture Recognition & Multi-Person Occupancy Detection
+### Occupancy Detection and 3D Gesture Recognition with Dual Novelda X7 Radars
+
+*Last updated: 2026-10-12. Engineering history in [`documentation/`](./documentation/).*
 
 ---
 
-## 1. Executive Summary
+## 1. Overview
 
-This repository contains the end-to-end pr         oduction AI software stack for **Dual Novelda X7 Ultra-Wideband (IR-UWB) Transceiver Radars**. The system provides real-time, touchless human-machine interaction and environmental awareness via two core machine learning pipelines:
+Two Novelda X7 IR-UWB radars (2 TX x 2 RX each) drive two pipelines:
 
-1. **3D Touchless Gesture Recognition:** A dual-branch Siamese / Late-Fusion Convolutional Neural Network that decodes spatial interferometry and Doppler micro-motion across **5 directional gesture classes** (**94.74% validation accuracy**, 89.1% through the full live capture path). Runs **continuously with no activation gesture**.
-2. **5-State Human Presence & Occupancy Detection:** A GPU-accelerated multi-scale 2D CNN that counts human occupants ($0$, $1$, $2$, $3$, or $4$ people) from chest breathing micro-displacements and aggregate radar reflection energy (**94.00% Real-World Holdout Accuracy**).
+| pipeline | what it does | status |
+|---|---|---|
+| **Occupancy (zone model)** | occupied / empty, front-row and back-row occupancy, from breathing and motion | **Proof of concept validated across days.** Occupied/empty and front row: AUC 1.000, 0% false alarm on a held-out day. Back row: indicator only. Per-person counting: not supported by this sensor geometry. |
+| **3D gesture recognition** | 5 directional gestures + "no gesture", continuous, no activation gesture | **v3, rebuilt Sep 29.** Deployed `models/gesture_v3.json` (7 sessions): 82.3% held-out accuracy, 90.2% precision with 76.6% of gestures recognised; **9/12** on natural left/right swipes captured the live way (Oct 12). Training data must be captured the way live captures it: Enter-armed deliberate swipes look like the *opposite* swipe (Section 4.5). |
 
-Both pipelines execute natively on **NVIDIA RTX 5090 (Blackwell Architecture, CUDA 13.2)** with zero-copy GPU tensor processing.
+**The proof of concept is recorded in a room with car-like seating** (2 front,
+2 back, front row ~0.7-1.0 m from the radar), with four occupants (2 men,
+2 women). The sensors are fixed **15 cm apart**, because the gesture pipeline
+needs that mounting.
+
+**Safety policy for occupancy:** a missed occupant is treated as worse than a
+false alarm. Thresholds target 99% recall; the system never reports `EMPTY`
+while warming up, while a sensor looks faulty, or while the setup appears to
+have moved.
+
+### What changed since the first version of this README
+The earlier README reported a **5-class occupant-count CNN at 94% accuracy**.
+That result did not survive testing: each occupancy level had been recorded on
+its own day, and the same architecture that scored 99.7% on those recordings
+scored **45%** on a new day (a classifier fed only range bins where nobody sits
+also scored 99.7%). It had learnt the recording session, not the occupants. The
+count CNN has been replaced by the zone model below; see
+`documentation/2026-09-21.md`, `2026-09-24.md` and `2026-09-25.md`.
 
 ---
 
-## 2. Model Performance & Evaluation Metrics
+## 2. Hardware, Range Map and Acquisition
 
-### A. 3D Gesture Recognition Model (`best_model_2s_5class.pth`)
+### 2.1 Radar configuration
 
-Five directional gestures, recognised continuously. **PINCH has been removed** — it
-was the gated-mode activation trigger but never fired reliably on live hardware, and
-carrying it in the label space also drew probability mass away from the directional
-gestures (measured on identical recordings: 98.3% vs 96.8% once its logit is removed).
+| | gesture | occupancy |
+|---|---|---|
+| preset | `default_preset.json` | `human_preset.json`, FPS injected at runtime |
+| frame rate | 40 FPS | **5 FPS** (`IterationsPerFrame` = 700 x 10 / FPS = 1400, +3 dB vs 10 FPS) |
+| range bins used | first 34 delivered, physical bins 20-33 (+0.05 .. +0.98 m) used | all 112 (-1.38 .. +6.55 m) |
+| window | 64 frames = 1.6 s | 30 s (three 10 s blocks) |
 
-* **Validation accuracy (held-out 20% split):** **94.74%**
-* **Full live-path accuracy (476 recordings, energy gate + capture + classify):** **89.1%**
+5 FPS is ~7x the Nyquist rate of breathing (0.20-0.33 Hz) and doubles the
+integration per frame; it is not used for gesture. The other 14 preset settings
+(TX power, masks, DC removal, ...) are identical. The two presets are
+deliberately different: presence integrates 1400 iterations for breathing,
+gestures need 40 FPS to follow a hand.
 
-#### Per-class (validation split):
-```text
-Class           Prec    Recall     F1     N
-SWIPE_LR       90.0%    94.7%   92.3%    19
-SWIPE_RL       94.7%    94.7%   94.7%    19
-SWIPE_UP      100.0%    89.5%   94.4%    19
-SWIPE_DOWN     90.5%   100.0%   95.0%    19
-PUSH_IN       100.0%    94.7%   97.3%    19
+### 2.2 Range map (measured, not assumed)
+`probe_range.py` reads the values the SDK itself reports:
+
+$$R(b) = R_0 + b\,\Delta R,\qquad R_0 = -1.38\ \text{m},\quad \Delta R = 71.4\ \text{mm}$$
+
+Bins 0-19 are negative range (behind the antenna, dominated by internal TX->RX
+coupling); **bin 20 is the first physical bin** (+0.05 m). A code comment once
+claimed 6.5 mm/bin -- wrong by 11x -- and everything is now derived from the
+measured constants in `x7_physics.py` (`BIN_LENGTH_M`, `RANGE_OFFSET_M`,
+`FIRST_PHYSICAL_BIN`).
+
+Other constants: $f_c = 7.29$ GHz, $\lambda = 41.1$ mm, antenna baselines
+$d_{TX} = d_{RX} = \lambda/2$.
+
+**Each board is a one-axis array** (measured Sep 28). The TX and RX baselines
+are parallel and equal, so the virtual elements TX1-RX0 and TX0-RX1 coincide
+(phase difference 0.03 rad) and the 2x2 array is a 3-element line. Each board
+measures angle along **one** axis -- the direction it is rotated to. There is
+no separate vertical baseline (`x7_physics.py` still names `D_RX_V_M`
+"vertical"; that is wrong). A board at roll $\alpha$ sees left-right motion in
+proportion to $\cos\alpha$ and up-down motion in proportion to $\sin\alpha$, so
+a gesture model is tied to the mounting it was recorded at. At the current
+mounting the axis points mostly **up/down**: up/down swipes swing the angle by
+2-5 rad, consistent in every session, while left/right is weak (Oct 5).
+Left/right relies on weaker cues such as which board the hand passes first
+(the boards are 15 cm apart), and on how the movement starts (Section 4.5).
+
+### 2.3 Dual-sensor acquisition
+* **Virtual MIMO frames:** each sensor's TX0/TX1 pulses are assembled into a
+  $(2\,\text{TX} \times 2\,\text{RX} \times B)$ complex frame; the two sensors
+  are paired by **SDK sequence number** (match within +-10). An earlier
+  software timestamp gate compared integer ticks against 0.05 s and starved the
+  queue; it was removed.
+* **Recording tensor:** $\mathbf{W} \in \mathbb{C}^{T \times 2 \times 2 \times 2 \times B}$
+  (frames, sensors, TX, RX, bins), saved as `.npy`.
+* **Process isolation (`x7_acq_worker.py`):** the Novelda callback SDK holds the
+  Python GIL while waiting for the next frame, which made inference in the same
+  interpreter ~13,000x slower (1 ms -> 13 s, 0.01 cores busy). Acquisition
+  therefore runs in its own process (`RadarProcess`, `kind="presence"` or
+  `kind="gesture"`) and ships frames over a pipe; the gesture worker also
+  reports the SDK's range map. The child watches its parent and exits if it dies, so a killed session
+  cannot leave the radar locked.
+* **The FT4222 USB bridge is exclusive-access.** A preflight in every radar
+  script counts connected FT4222H interfaces (4 expected) and clears orphaned
+  acquisition processes. The SDK's "check the DCNF0/1 jumpers" message almost
+  always means an unplugged board or a stale process, not the jumpers.
+
+---
+
+## 3. Occupancy Detection -- Zone Model (`x7_presence_zone.py`)
+
+### 3.1 Design
+A fixed physics front end, **36 learned parameters**, and an asymmetric state
+machine. numpy only -- no GPU, no neural network.
+
+**Why so small:** v2 contains ~800 recordings but only ~16 independent
+*sit-downs*. At $\lambda = 41$ mm a 1 cm shift of a torso rotates round-trip
+phase by ~90 deg, so every sit-down has a unique, stable phase fingerprint. Every
+higher-capacity model tried (count CNN, per-seat CNN) scored ~100% by
+recognising the sit-down and chance on a new one. These features never see
+absolute phase or absolute amplitude.
+
+### 3.2 Pipeline
 ```
-
-#### Live-path confusion matrix (row: true, col: predicted):
-```text
-              SWIPE_LR  SWIPE_RL  SWIPE_UP  SWIPE_DN   PUSH_IN
-SWIPE_LR            92         0         2         2         0
-SWIPE_RL             1        86         7         1         0
-SWIPE_UP             1         0        89         2         1
-SWIPE_DOWN           0         0        13        81         1
-PUSH_IN              1         1        14         3        76
+frames (5 Hz, 2 sensors x 4 virtual channels x 112 bins)
+  -> 10 s blocks: quadratic detrend over time (MTI + drift removal), FFT
+       breathing band 0.2-0.5 Hz, noise band 0.8-2.5 Hz
+       reference floor: bins behind the antenna (no occupant possible)
+  -> zones: front 0.35-1.05 m (bins 25-34, 80 channels)
+            back  1.25-2.00 m (bins 37-47, 88 channels)   [shifted by calibration]
+  -> per zone, over a 30 s window (3 blocks):
+       eig    log(top whitened eigenvalue / Marchenko-Pastur edge)
+       ncomp  log(1 + eigenvalues above the edge)
+       snr    log(max breathing power / reference floor)
+       br     log(max breathing power / own noise band)
+       motion log(noise-band power / reference floor)
+     + front/back coherence of the dominant components (leak rejection)   -> 11 features
+  -> 3 logistic regressions: P(occupied), P(front), P(back)
+  -> state machine (decision every 1 s)
 ```
+The detrend matters: in a 10 s window the 0.2 Hz bin is two bins from DC, and
+slow drift otherwise looks like breathing (an empty room showed 77 "sources"
+before detrending, 1 after).
 
-> The legacy 7-class model (`best_model_2s.pth`, six gestures plus NOISE) is retained
-> in `models/` for reference. It cannot be retrained from `gesture_dataset_2s_new`,
-> which contains no NOISE recordings.
+### 3.3 State machine and safety policy
+* thresholds at **>= 99% out-of-fold recall**
+* `OCCUPIED` is entered at once (probability over threshold, or per-frame motion)
+  and **held 45 s** after the last evidence; `EMPTY` therefore appears ~60-75 s
+  after everyone leaves (30 s window + hold)
+* the hold is set by data: the longest run of missed windows in any sit-down was
+  ~30 s (a lone back-seat occupant), so a shorter hold could flicker to `EMPTY`
+* warm-up (first 30 s) shows `UNKNOWN`, or `OCCUPIED (motion)` if someone moves;
+  never `EMPTY`
+* **back row is shown as `Y` or `?`, never `-`**: at 99% recall it would flag
+  ~54-67% of empty back rows, so only a confident-positive threshold (1% false
+  alarm, 61% recall) is used, and it never drives `OCCUPIED`
+* stalled frames -> `SENSOR FAULT`; health warnings -> `UNKNOWN` instead of `EMPTY`
 
-#### Live capture is peak-driven, not fixed-length
-The lag between crossing the motion threshold and the gesture's energy peak is **not
-constant** — measured across the corpus it spans 1 to 97 frames, and its mean differs
-per gesture (SWIPE_UP ~17 frames, PUSH_IN ~34). A fixed capture length therefore
-centres the model's window correctly for some gestures and not others: with a fixed
-50-frame gather, PUSH_IN collapsed to 2/25 while swipes were unaffected.
+### 3.4 Results
 
-The capture instead tracks the running energy maximum and stops only once the gesture
-has demonstrably peaked — energy falling for `DECAY_FRAMES` consecutive frames **and**
-at least `POST_PEAK_FRAMES` elapsed since the peak, so the second half of the window
-holds real data rather than edge padding. This lifted the live path from 68.8% to
-**89.1%** with every class above 80%.
+**Cross-day bridge test** -- trained on v2 (Sep 11-22, one occupancy level per
+day), tested on v3 (Sep 25, every level on one day, same setup):
 
----
+| model | occupied | front row | back row |
+|---|---|---|---|
+| **zone model** | AUC **1.000**, recall 100%, FA **0.0%** | AUC **1.000**, recall 97.9%, FA **0.0%** | AUC 0.954, FA 53.8% (indicator only) |
+| count CNN (old approach), 5-class | 45.4% accuracy (balanced 55.3%) | -- | -- |
+| count CNN, only bins > 3.55 m (control) | 31.5% | -- | -- |
+| per-seat CNN | count 42.6% | seats 1/2: 81% / 81% | seats 3/4: 49% / 40% |
 
-### B. 5-Class Human Presence Model (`best_model_2s_presence.pth`)
+**Leave-one-day-out, final model (v2 + v3, 30 s window, 99% recall):**
 
-Evaluated on **100 pure real-world holdout recordings** (`human_dataset_2s_test_holdout`):
+| output | AUC | false alarm |
+|---|---|---|
+| occupied | 0.996 | 14.8% |
+| front row | 0.998 | 5.5% |
+| back row | 0.944 | 67.3% -> "Y or ?" at 1% FA, 61.1% recall |
 
-* **Overall Holdout Accuracy:** **94.00%** (94 / 100 Correct Predictions)
-* **Empty Room False Alarm Rate:** **0.0%** (100% Precision, 100% Recall on `0_people`)
+**State machine on the held-out day** (replay, v2-only model, 30 s window):
+missed-occupant **0.2%** of decisions; `EMPTY` after 39 s (10 s hold), 59 s
+(30 s hold), 89 s (60 s hold). Compute: 0.01 ms per frame, 8 ms per decision
+(desktop Python).
 
-#### Detailed Per-Class Metrics:
-```text
-========================================================================================
-Class Name      | Precision  | Recall     | F1-Score   | Support (Test Samples)
-========================================================================================
-0_people        |    100.0% |    100.0% |    100.0% | 20
-1_people        |     95.2% |    100.0% |     97.6% | 20
-2_people        |     96.2% |     83.3% |     89.3% | 30
-3_people        |     82.6% |     95.0% |     88.4% | 20
-4_people        |    100.0% |    100.0% |    100.0% | 10
-========================================================================================
-```
+A no-seat control region (2.6-3.9 m) also separates occupied from empty. This is
+physical -- occupants shadow the walls behind them and reflect into far bins,
+reproduced on two separate empty days -- so for occupied/empty the evidence is
+the transfer to a new day's empty trials, not the control.
 
-#### $5 \times 5$ Confusion Matrix:
-```text
-Ground Truth \ Predicted | 0_people | 1_people | 2_people | 3_people | 4_people
---------------------------------------------------------------------------------
-0_people                 |    20    |    0     |    0     |    0     |    0
-1_people                 |     0    |   20     |    0     |    0     |    0
-2_people                 |     0    |    1     |   25     |    4     |    0
-3_people                 |     0    |    0     |    1     |   19     |    0
-4_people                 |     0    |    0     |    0     |    0     |   10
-================================================================================
-```
+### 3.5 Calibration, setup-change monitoring and self-test (`x7_presence_setup.py`)
+Invariant by construction: sensor gain (+-6 dB), per-antenna phase, day-to-day
+drift. **Not** invariant: where the rows sit relative to the fixed zones.
+Simulated on the held-out day:
 
----
+| change | occupied recall / FA | front recall / FA |
+|---|---|---|
+| none | 100% / 0% | 97.9% / 0% |
+| radar 21 cm farther, old calibration | 93.3% / 0% | 79.2% / 0% |
+| radar 21 cm farther, **recalibrated** | 100% / 0% | **97.9% / 0%** |
+| radar 14 cm closer, old calibration | 100% / 0% | 100% / 11.5% |
+| radar 14 cm closer, **recalibrated** | 100% / 0% | **100% / 0%** |
 
-## 3. Detailed Neural Network Architectures
+* **Calibration** finds each row's breathing peak (one person per seat) and
+  shifts the trained zones by whole range bins; widths never change. Front
+  offsets under 5 cm are treated as normal day-to-day variation; the back row
+  follows the front unless they disagree by > 10 cm. It also sets the room's
+  motion threshold and the receiver noise reference.
+* **Health monitor (in `live`):** front-row breathing peak drifting > 10 cm over
+  ~3 min of occupancy -> zones auto-align (rounded toward zero, max 30 cm) or
+  `SETUP CHANGED, recalibrate`; receiver noise > 6 dB off calibration for 30 s
+  -> `check the radar`; a calibration made for another model -> stale warning.
+  Room-clutter fingerprints and wall-reflector lags were tested and could not
+  tell a moved radar from an unchanged one; the front-row peak tracks a move to
+  within a few cm.
+* **`check`** (daily, ~4 min) scores one pass against the current calibration
+  and recomputes it; it adopts a new calibration only if the setup moved and the
+  new one passes a replay of the same recordings.
+* Seats cannot be calibrated in pairs: with a front and a back occupant the
+  back-row estimate locked onto front leakage (0.91 m vs 1.53 m); two people in
+  one row read +2 to +21 cm off.
 
-See visual flow in [`architecture.mmd`](./architecture.mmd).
+Current live calibration (2026-09-28): both rows **+29 cm** farther than in
+training (front 0.99 m, back 1.79 m); self-test passed.
 
-### A. 3D Gesture CNN (`GestureCNN_X7_Dual`)
-* **Paradigm:** Dual-Branch Siamese Late Fusion with Cross-Sensor Interferometry.
-* **Input Tensor:** $(B, 2, 8, 34, 64)$ — Batch, 2 Sensors, 8 Physical Channels, 34 Range Bins, 64 Frames.
-* **Branch 1 & 2 (Per-Sensor Feature Extractor):**
-  * `Conv2D(8 -> 64, kernel=3, pad=1)` $\to$ `BatchNorm2d` $\to$ `ReLU` $\to$ `MaxPool2d(2)` $\to$ `Dropout2d(0.1)`
-  * `Conv2D(64 -> 128, kernel=3, pad=1)` $\to$ `BatchNorm2d` $\to$ `ReLU` $\to$ `MaxPool2d(2)` $\to$ `Dropout2d(0.1)`
-  * `Conv2D(128 -> 256, kernel=3, pad=1)` $\to$ `BatchNorm2d` $\to$ `ReLU` $\to$ `MaxPool2d(2)`
-  * `Conv2D(256 -> 512, kernel=3, pad=1)` $\to$ `BatchNorm2d` $\to$ `ReLU`
-  * `AdaptiveAvgPool2d((4, 4))` $\to$ `Flatten()` $\to$ **8,192 features per branch**.
-* **Late Fusion Classifier:**
-  * Concatenation: $\text{Branch}_1 \oplus \text{Branch}_2 \implies 16,384$ features.
-  * `Linear(16384 -> 512)` $\to$ `ReLU` $\to$ `Dropout(0.5)`
-  * `Linear(512 -> 128)` $\to$ `ReLU` $\to$ `Dropout(0.3)`
-  * `Linear(128 -> 7)` $\to$ **7 Class Logits**.
-
----
-
-### B. Human Presence CNN (`PresenceCNN_X7_Dual`)
-* **Paradigm:** GPU-Accelerated Multi-Scale 2D Convolutional Energy & Micro-Doppler Classifier.
-* **Input Tensor:** $(B, 2, 50, 339)$ — Batch, 2 Sensors, 50 Frames (5 sec), 339 Range Bins.
-* **Convolutional Backbone:**
-  * `Block 1`: `Conv2D(2 -> 16, 3x3, pad=1)` $\to$ `BN` $\to$ `ReLU` $\to$ `MaxPool2D(2)` $\to$ Tensor: `(16, 25, 169)`
-  * `Block 2`: `Conv2D(16 -> 32, 3x3, pad=1)` $\to$ `BN` $\to$ `ReLU` $\to$ `MaxPool2D(2)` $\to$ Tensor: `(32, 12, 84)`
-  * `Block 3`: `Conv2D(32 -> 64, 3x3, pad=1)` $\to$ `BN` $\to$ `ReLU` $\to$ `MaxPool2D(2)` $\to$ Tensor: `(64, 6, 42)`
-  * `Block 4`: `Conv2D(64 -> 128, 3x3, pad=1)` $\to$ `BN` $\to$ `ReLU` $\to$ `MaxPool2D(2)` $\to$ Tensor: `(128, 3, 21)`
-  * `Global Pooling`: `AdaptiveAvgPool2D((1, 1))` $\to$ Tensor: `(128, 1, 1)`
-* **Classifier:**
-  * `Flatten()` $\to$ `Dropout(0.3)` $\to$ `Linear(128 -> 5)` $\to$ **5 Occupancy Class Logits**.
-
----
-
-## 4. Novelda X7 SDK Modules & Integration
-
-The system interfaces with the Novelda X7 Ultra-Wideband Radar hardware using the low-level C++ DLL libraries linked through Python wrappers in `novelda-uwb-demos`.
-
-### Core SDK Modules Used:
-1. **`RadarDirectCallback` (`radar_direct_callback.py`):**
-   * High-throughput asynchronous callback driver that streams raw baseband complex I/Q radar frames over USB/UART without intermediate OS socket buffering.
-2. **`X7RadarDirectCallback` Presets:**
-   * `default_preset.json` — Optimized for high frame rate gesture detection (40 FPS, 34 range bins up to ~1.2 meters).
-   * `human_preset.json` — Optimized for deep room penetration (10 FPS, 339 range bins up to ~5.0 meters).
-3. **`X7DualRadar` Synchronizer (`x7_2s_record.py` / `x7_2s_live.py`):**
-   * Multi-threaded producer-consumer pipeline with sequence number tracking and a software timestamp tolerance gate ($\Delta t < 50\,\text{ms}$) to guarantee frame alignment between Front and Side radars.
-4. **Virtual MIMO Frame Assembly:**
-   * Each X7 sensor possesses 2 Transmit (TX0, TX1) and 2 Receive (RX0, RX1) antennas. The SDK driver interleaves pulses to construct a complete 5D complex matrix per recording:
-     $$\mathbf{W} \in \mathbb{C}^{T \times S \times N_{\text{TX}} \times N_{\text{RX}} \times N_{\text{bins}}} \quad (T \text{ Frames}, S=2 \text{ Sensors}, 2\,\text{TX}, 2\,\text{RX}, B \text{ Bins})$$
+### 3.6 Limitations
+* **No per-person count.** With sensors 15 cm apart, left/right separation is
+  1.9-2.5 bins in the front row and 0.8-1.1 in the back; two people in one row
+  merge into one return. One person produces 4-5 independent components in the
+  breathing band, so source counting does not give a head count either.
+* **Back row is weak:** ~11 dB below the front row (R^-4), and front-row
+  breathing leaks into its bins. Sensors >= 50 cm apart would fix both but are
+  not possible while the gesture mounting is shared.
+* **Validated in one room** with four people. Other rooms, a real car cabin,
+  more people, objects on seats and posture changes are untested; robustness
+  can only be claimed for factors that were varied.
+* v3 was recorded one scenario at a time, so it supports cross-day testing only
+  (`check_confound.py`: `PARTIAL`). The next dataset should be one interleaved
+  recorder run with re-seating before every trial.
 
 ---
 
-## 5. Mathematical Formulations & DSP Theory
+## 4. 3D Gesture Recognition (v3, `x7_gesture_*.py`)
 
-### 1. Radar Range Bin to Distance Mapping
-The physical distance $R(b)$ corresponding to range bin index $b$ is given by:
-$$R(b) = R_0 + b \cdot \Delta R = R_0 + b \cdot \frac{c}{2 f_s \sqrt{\varepsilon_r}}$$
-Where $c = 3 \times 10^8\,\text{m/s}$, $f_s$ is the baseband sampling frequency, and $R_0$ is the antenna offset delay.
+Rebuilt on Sep 29 after the old pipeline failed at the current mounting (the
+deployed `m5_now` ensemble scored **7%** there, confidently wrong). Recording,
+training and live all use one core module, so their trigger, windowing and
+features cannot drift apart.
+
+### 4.1 Classes
+`SWIPE_LR`, `SWIPE_RL`, `SWIPE_UD` (up -> down), `SWIPE_DU` (down -> up),
+`PUSH_IN`, and **`NO_GESTURE`**: non-gesture movements that trip the trigger
+(reaching, scratching, adjusting in the seat). These teach the model to stay
+silent. Vary them: one session's swipe-like non-gestures caused every
+remaining false report (Sep 30).
+
+### 4.2 Trigger and capture (`x7_gesture_core.Segmenter`)
+* 40 FPS, **64-frame window** (1.6 s), peak-driven capture: the capture follows
+  the running energy maximum and closes after 6 falling frames, 40 frames after
+  the peak, or 110 frames; 20-frame cooldown.
+* **Trigger energy:** moving energy in physical bins 20-33, divided by the
+  noise floor behind the antenna (bins 0-15). The background adapts slowly
+  (EMA, $\tau$ = 2 s) so a moving hand is not absorbed.
+* **Trigger level:** 6x the idle level. The idle level comes from a 3 s
+  warm-up (keep still), then is re-estimated every second from the 20th
+  percentile of the last 30 s. It may only go **down**: a warm-up spoiled by
+  movement recovers, and frequent gesturing cannot raise the trigger.
+* While waiting, the recorder and live calibration show
+  `energy N.Nx idle / trigger 6x`, or `radar sends NO FRAMES for N s`.
+* **Recording uses the same automatic trigger as live** (default again since
+  Oct 12). `--manual` arms each capture with **Enter** instead (added Oct 5);
+  that captures only the deliberate stroke, which does **not** match what live
+  detection captures, so it is not used for training the live model.
+* **Direction check while recording:** each swipe is scored with the current
+  model. If it looks like the opposite swipe (confidence >= 0.6), the recorder
+  warns and `x` redoes it.
+
+### 4.3 Features and model
+* **Input per board** (2 boards x C x 14 bins x 64 frames), after removing the
+  window mean:
+  * `angle`: the board's four single-baseline pairs averaged coherently into one
+    angle, as a unit phasor (Re, Im);
+  * `amp`: MTI amplitude, z-scored within the window;
+  * `doppler`: inter-frame phasor (optional, not used).
+  * Default `angle+amp` (3 channels). Measured at the current mounting,
+    `angle+amp` beat angle alone (53.9% vs 50.0%, with time reversal).
+* **Model:** compact two-branch CNN, one branch per board (the boards are
+  mounted differently), **113,606 parameters** (the old model had 11.6 M). A
+  3-seed ensemble.
+* **Training** (`x7_gesture_train.py`):
+  * AdamW with a cosine schedule, class-weighted cross-entropy with label
+    smoothing 0.05, 60 epochs;
+  * augmentation: time shift, pace 0.8-1.25x, range shift ±1 bin (±7 cm),
+    noise;
+  * **time reversal:** a swipe played backwards is the opposite swipe (LR↔RL,
+    UD↔DU), which doubles the data.
+* **Evaluation:** leave-one-session-out only. The old random per-file split
+  overstated accuracy by ~14 points.
+* **Decision** (`GestureModel.decide`): a gesture is reported only if the
+  prediction is not `NO_GESTURE`, its confidence clears the floor, and its
+  **margin** (top minus second probability) clears the margin floor. The
+  trainer picks both floors on the held-out predictions: the highest recall at
+  `--target-precision`; if unreachable, the best precision with recall >= 15%.
+
+### 4.4 Results (`models/gesture_v3.json`, trained 2026-09-30)
+Data: `gesture_dataset_v3/`, 7 sessions (Sep 29: 4, Sep 30: 3), 378 captures,
+all recorded with the automatic trigger.
+
+| | value |
+|---|---|
+| held-out session accuracy | **82.3%** (per session 67.7-94.2%) |
+| floors | confidence 0.65, margin 0.40 (`--target-precision 0.9`) |
+| precision / gestures recognised | **90.2% / 76.6%** |
+| natural left/right swipes, automatic trigger (`live_style_test/`, Oct 12) | **9/12** |
+| cross-day | the Sep 29 model, frozen, scored 83.2% on Sep 30 |
+| per gesture recognised | LR 83%, RL 72%, UD 72%, DU 71%, PUSH 85% |
+
+What was measured to matter:
+
+| lever | effect |
+|---|---|
+| more **sessions** | held-out 61.9 / 69.5 / 76.6 / 82.1% with 1 / 2 / 3 / 5 training sessions; not levelled off |
+| more captures within a session | stops helping at ~8 per gesture |
+| 5 models, averaging over time shifts, 120 epochs | within ±1 point: the model is not the limit |
+| pretraining on the old corpus | hurt (41% -> 21%): other mountings contradict this one |
+| session calibration (2 per class) | +13 points with 2 sessions; not re-measured with 7 (the base model already holds across days) |
+
+**Seat moved** (simulated range shift of held-out captures):
+
+| shift | 14 cm closer | 7 cm closer | none | 7 cm back | 14 cm back |
+|---|---|---|---|---|---|
+| gestures recognised | 69.2% | 73.6% | 76.6% | 74.9% | 67.6% |
+
+A 5-10 cm move needs nothing; beyond that, record sessions at the new
+positions.
+
+### 4.5 Capture style decides what a swipe looks like (Oct 5-12)
+* **Oct 5:** right→left was hard to detect live. Ten deliberate swipes recorded
+  with the Enter trigger, hand still at both ends (`direction_test/`), were
+  read as the opposite swipe 8/10 by `gesture_v3`. The September left/right
+  labels were concluded to be reversed and relabelled. The corrected model
+  (`_trial_corrected`, since deleted) scored 84.7% held out and 10/10 on `direction_test/`.
+* **Oct 12:** live with the corrected model, left and right were swapped. Twelve
+  natural swipes recorded with the automatic trigger (`live_style_test/`)
+  settled it:
+
+  | training labels | `live_style_test/` (live way) | `direction_test/` (Enter) |
+  |---|---|---|
+  | **September as recorded** | **10/12** | 1/10 |
+  | September as recorded + Oct 5 sessions | 8/12 | 6/10 |
+  | September relabelled + Oct 5 (`_trial_corrected`) | 0/12 | 10/10 |
+
+* **Conclusion:** the September labels were right for natural swipes. A
+  natural swipe captured the way live captures it (movement already under way,
+  including the move into position) and an Enter-armed deliberate stroke have
+  opposite signatures. The Oct 5 relabelling was undone
+  (`models/_unswap_LRRL_20261012_log.json`). The Enter-style sessions G10051022
+  and G10051151 were moved to `gesture_dataset_enter_style/`. Their labels are
+  as performed; they are kept for a possible Enter-style live mode.
+* **Rule:** record training data with the same trigger and the same natural
+  movement as live use. Test a model on `live_style_test/`, not only on
+  `direction_test/`.
+
+### 4.6 Limitations
+* **Left vs right** is the weaker distinction at the current mounting, because
+  each board's axis points mostly up/down (Section 2.2), and it depends on how
+  the movement starts (Section 4.5). Up/down is strong.
+* One room, one seat position, two days of training data. Hand distances 0.50-0.60 m are
+  under-represented (50% recognised, measured on Sep 30).
+
+### 4.7 Superseded gesture pipeline (`x7_2s_*.py`)
+The old pipeline (10-channel input with a duplicate "vertical" AoA, 11.6 M
+parameters, raw-energy trigger, one gesture per recording burst) and its
+models `m5_now_seed{0,1,2}.pth` and `best_model_2s_5class.pth` are kept for
+reference. They were trained at earlier mountings and do not work at the current
+one. The Sep 10 advice to re-mount the boards "upright" was based on the
+non-existent vertical baseline (see 2.2).
 
 ---
 
-### 2. Moving Target Indicator (MTI) Static Clutter Filter
-To remove static background reflections (walls, vehicle seats, dashboard) and isolate breathing and moving hands:
-$$\mathbf{W}_{\text{MTI}}(t, s, i, j, b) = \mathbf{W}(t, s, i, j, b) - \frac{1}{T}\sum_{\tau=0}^{T-1} \mathbf{W}(\tau, s, i, j, b)$$
+## 5. Mathematical Formulations & DSP Reference
 
----
+### 5.1 Range mapping
+$$R(b) = -1.38\ \text{m} + b \cdot 0.0714\ \text{m}$$
 
-### 3. Complex Cross-Antenna Interferometric Unit Phasor
-The cross-correlation between two antenna channels $z_1, z_2 \in \mathbb{C}$ extracts instantaneous phase difference while suppressing amplitude variation:
-$$\Phi(z_1, z_2) = \frac{z_1 \cdot z_2^*}{|z_1 \cdot z_2^*| + \varepsilon}$$
-Where $z_2^*$ denotes the complex conjugate and $\varepsilon = 10^{-9}$ prevents division by zero.
+### 5.2 Static clutter removal
+Gesture (window mean):
+$$\mathbf{W}_{\text{MTI}}(t) = \mathbf{W}(t) - \frac{1}{T}\sum_{\tau}\mathbf{W}(\tau)$$
+Occupancy (quadratic detrend per channel over each 10 s block):
+$$\mathbf{x}_{\text{MTI}} = \big(\mathbf{I} - \mathbf{V}\mathbf{V}^{+}\big)\,\mathbf{x},\qquad \mathbf{V} = [\,\mathbf{1},\ \mathbf{t},\ \mathbf{t}^2\,]$$
 
----
+### 5.3 Unit phasor and angle of arrival
+$$\Phi(z_1, z_2) = \frac{z_1 z_2^*}{|z_1 z_2^*| + \varepsilon},\qquad \Delta\phi = \frac{2\pi d \sin\theta}{\lambda},\quad d = \lambda/2$$
+The TX pair and the RX pair are parallel baselines of the same length, so
+$\Phi(\text{TX}_0\text{RX}_0,\ \text{TX}_1\text{RX}_0)$ and
+$\Phi(\text{TX}_0\text{RX}_0,\ \text{TX}_0\text{RX}_1)$ measure the **same**
+angle (noise-cancelled correlation 0.91-0.98). v3 therefore averages the four
+single-baseline pairs coherently:
+$$z = v_{00}v_{10}^* + v_{01}v_{11}^* + v_{00}v_{01}^* + v_{10}v_{11}^*,\qquad \text{angle} = z/|z|$$
 
-### 4. Angle of Arrival (AoA) Physical Channels
-For each sensor array with antenna spacing $d$:
-* **Horizontal Phasor:**
-  $$\mathbf{H}(t, b) = \Phi\Big(\mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_0, b),\, \mathbf{W}_{\text{MTI}}(t, \text{TX}_1, \text{RX}_0, b)\Big)$$
-  $$\Delta \phi_H = \arg(\mathbf{H}) = \frac{2\pi d_H \sin\theta_H}{\lambda}$$
-* **Vertical Phasor:**
-  $$\mathbf{V}(t, b) = \Phi\Big(\mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_0, b),\, \mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_1, b)\Big)$$
-  $$\Delta \phi_V = \arg(\mathbf{V}) = \frac{2\pi d_V \sin\theta_V}{\lambda}$$
+### 5.4 Doppler phasor and aliasing
+$$\mathbf{D}(t) = \Phi\big(\mathbf{W}(t),\ \mathbf{W}(t-1)\big),\qquad v_{\max} = \frac{\lambda \cdot \text{FPS}}{4} = 0.41\ \text{m/s at 40 FPS}$$
+Faster radial motion wraps; encoding (Re, Im) keeps the wrap continuous.
 
----
+### 5.5 Path loss
+Received power falls as $R^{-4}$: a 20 cm seat move at 0.6 m changes power by
+~5 dB, and the back row (~1.5 m) is ~11 dB below the front row (~0.7 m). Any
+feature reading absolute amplitude inherits this as nuisance; the occupancy
+features use ratios and whitened statistics instead.
 
-### 5. Instantaneous Doppler Velocity Phasor
-The temporal phase derivative between successive frames $t$ and $t-1$ yields radial velocity $v_r$:
-$$\mathbf{D}(t, b) = \Phi\Big(\mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_0, b),\, \mathbf{W}_{\text{MTI}}(t-1, \text{TX}_0, \text{RX}_0, b)\Big)$$
-$$f_D = \frac{1}{2\pi \Delta t}\arg(\mathbf{D}) = \frac{2 v_r}{\lambda}$$
+### 5.6 Breathing resolution
+A window of length $T$ resolves $\Delta f = 1/T$: at 10 s the whole adult
+breathing band (0.20-0.33 Hz) is ~1.3 bins, so people cannot be separated by
+breathing rate; rates 0.05 Hz apart need $T \ge 20$ s.
 
----
+### 5.7 Occupancy features
+For zone snapshots $\mathbf{S} \in \mathbb{C}^{n \times p}$ (breathing-band FFT
+bins x channels), each channel whitened by its own noise-band power,
+$$\hat{\mathbf{C}} = \tfrac{1}{n}\,\mathbf{S}_w^{H}\mathbf{S}_w,\qquad \lambda_{\text{edge}} = \big(1 + \sqrt{p/n}\big)^2$$
+Pure noise stays below the Marchenko-Pastur edge; `eig` = $\log(\lambda_1/\lambda_{\text{edge}})$,
+`ncomp` = number of eigenvalues above it. Coherence between the zones' dominant
+components, $|\langle \mathbf{a}, \mathbf{b} \rangle|^2 / (\|\mathbf{a}\|^2\|\mathbf{b}\|^2)$,
+rejects front-row breathing that leaks into back-row bins.
 
-### 6. Spatial Energy Skew & Amplitude Normalization
-$$\bar{A}(t, b) = \frac{1}{4}\sum_{i=0}^1 \sum_{j=0}^1 |\mathbf{W}_{\text{MTI}}(t, i, j, b)|$$
-$$A_{\text{norm}}(t, b) = \frac{\bar{A}(t, b) - \mu_A}{\sigma_A + \varepsilon}$$
-$$A_{H\text{norm}}(t, b) = \frac{|\mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_0, b)| - |\mathbf{W}_{\text{MTI}}(t, \text{TX}_1, \text{RX}_0, b)|}{|\mathbf{W}_{\text{MTI}}(t, \text{TX}_0, \text{RX}_0, b)| + |\mathbf{W}_{\text{MTI}}(t, \text{TX}_1, \text{RX}_0, b)| + \varepsilon}$$
+### 5.8 Classifier and threshold
+$$P(y=1 \mid \mathbf{f}) = \sigma\big(\mathbf{w}^\top \tfrac{\mathbf{f}-\boldsymbol{\mu}}{\boldsymbol{\sigma}} + b\big)$$
+Class-balanced logistic regression (C = 0.5) per output; the threshold is the
+1st percentile of out-of-fold positive scores (leave-one-day-out where possible),
+i.e. 99% recall.
 
----
-
-### 7. Absolute Reflection Energy Logarithmic Compression (Presence Model)
-To preserve the physical property that $N$ people reflect $\approx N \times$ the energy of 1 person while stabilizing neural network gradients:
-$$\mathbf{X}_{\text{presence}}(s, t, b) = \ln\left(1 + 100 \cdot \frac{1}{4}\sum_{i=0}^1 \sum_{j=0}^1 |\mathbf{W}_{\text{MTI}}(t, s, i, j, b)|\right)$$
-
----
-
-### 8. Cross-Entropy Loss with Label Smoothing
-$$\mathcal{L}_{\text{CE}}(\mathbf{y}, \hat{\mathbf{p}}) = -\sum_{k=1}^K \tilde{y}_k \log \hat{p}_k, \quad \text{where } \tilde{y}_k = (1 - \alpha)\,\mathbb{I}(y = k) + \frac{\alpha}{K}$$
-With smoothing factor $\alpha = 0.05$ for regularized generalization.
-
----
-
-### 9. Cosine Annealing Learning Rate Schedule
-$$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\left(\frac{t}{T_{\max}}\pi\right)\right)$$
+### 5.9 Gesture training
+Class-weighted, label-smoothed cross-entropy with a cosine learning rate:
+$$\mathcal{L} = -\sum_k \tilde{y}_k \log \hat{p}_k,\quad \tilde{y}_k = (1-\alpha)\,\mathbb{I}(y=k) + \alpha/K,\ \alpha = 0.05;\qquad \eta_t = \eta_{\min} + \tfrac12(\eta_{\max}-\eta_{\min})\big(1+\cos\tfrac{\pi t}{T_{\max}}\big)$$
+Reporting rule, with sorted class probabilities $p_{(1)} \ge p_{(2)}$:
+$$\text{report } \arg\max_k \hat p_k \iff \arg\max_k \hat p_k \ne \texttt{NO\_GESTURE},\ \ p_{(1)} \ge c,\ \ p_{(1)} - p_{(2)} \ge m$$
 
 ---
 
 ## 6. CLI Usage & Execution Reference
+
+All commands run from the repository root. The radar host IDs used throughout
+are `529` (sensor 1) and `545` (sensor 2). Seat numbering for presence:
+**seats 1, 2 = front row, seats 3, 4 = back row.**
 
 ### Environment Setup
 ```powershell
@@ -224,33 +440,321 @@ $$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\le
 # Verify RTX 5090 CUDA 13.2 support
 python -c "import torch; print('CUDA Ready:', torch.cuda.is_available(), '| GPU:', torch.cuda.get_device_name(0))"
 ```
+If the NVIDIA driver is down, any PyTorch GPU call (and even a CPU `backward()`)
+in `.venv` segfaults. Reboot; until then, CPU-only training works with the
+system interpreter (same torch version, CPU build):
+```powershell
+C:\Users\Admin\AppData\Local\Programs\Python\Python310\python.exe x7_2s_train_presence_seats.py --cpu
+```
+The presence zone model (`x7_presence_zone.py`, `x7_presence_setup.py`) is numpy
+only and does not need the GPU at all.
 
-### 1. 3D Gesture Recognition
-* **Offline Evaluation:**
+### Hardware checks
+* **What the radar reports (bin count, range offset, bin length):**
   ```powershell
-  python x7_2s_eval.py
+  python probe_range.py
   ```
-* **Retrain Gesture Model:**
-  ```powershell
-  python x7_2s_train.py --epochs 80
-  ```
-* **Live Dual-Radar Inference (continuous, no activation gesture):**
-  ```powershell
-  python x7_2s_live.py --host1 <PORT_OR_IP_1> --host2 <PORT_OR_IP_2>
-  # tune the motion gate for your room if needed:
-  python x7_2s_live.py --host1 529 --host2 545 --threshold 600
-  ```
+* **The FT4222 is exclusive-access.** Only one program may use the radar at a
+  time -- never run live detection and the recorder together. Every radar
+  script runs a preflight that (a) reports if fewer than 4 FT4222H USB
+  interfaces are connected and (b) kills orphaned acquisition processes. The SDK
+  error *"Could not find a FT4222 device configured in mode 0 ... DCNF0/1
+  jumpers"* almost never means the jumpers: it means a board is unplugged or a
+  stale process still holds the device (then replug the USB).
 
-### 2. Human Presence & Occupancy Detection
-* **Offline Evaluation (5 Classes):**
-  ```powershell
-  python x7_2s_eval_presence.py --data human_dataset_2s_test_holdout --model models/best_model_2s_presence.pth
-  ```
-* **GPU-Accelerated Retraining (40 Epochs in ~25s):**
-  ```powershell
-  python x7_2s_train_presence.py --data human_dataset_2s_augmented --val_data human_dataset_2s_test_holdout --epochs 40 --batch_size 64
-  ```
-* **Generate Intra-Class Synthetic Augmentation:**
-  ```powershell
-  python x7_2s_synthesize_data.py --src human_dataset_2s --target_per_class 600
-  ```
+---
+
+### 1. Human Presence & Occupancy -- zone model (current pipeline)
+
+Outputs **occupied / empty**, **front row** and **back row** (back row is shown
+as `Y` or `?` only -- never `-` -- because with the sensors 15 cm apart it
+cannot reliably say a back seat is empty). Validated leave-one-day-out and on a
+held-out day; see `documentation/2026-09-25.md`.
+
+#### Daily routine (~4 min, before every session)
+```powershell
+python x7_presence_setup.py check --host1 529 --host2 545
+python x7_presence_zone.py live  --host1 529 --host2 545
+```
+`check` records empty 45 s, then one person each in seats 3, 4, 1, 2 (35 s),
+scores it against the current calibration and computes a fresh one.
+`>>> PASS -- go live` means the setup is unchanged. `>>> RECALIBRATED` means it
+moved: the new calibration was replayed over the same recordings, passed, and
+was adopted (the old one is kept as `models/presence_calib_prev.json`).
+During `check`, `calibrate` and `selftest` the operator stays in **one place, at
+least 2.5 m from the radar**.
+
+#### Live detection
+```powershell
+python x7_presence_zone.py live --host1 529 --host2 545
+python x7_presence_zone.py live --host1 529 --host2 545 --duration 120        # stop after 120 s
+python x7_presence_zone.py live --host1 529 --host2 545 --exit-s 30           # shorter hold (riskier)
+python x7_presence_zone.py live --host1 529 --host2 545 --no-auto-align       # report a moved setup, don't realign
+python x7_presence_zone.py live --host1 529 --host2 545 --calib models/presence_calib.json
+```
+Status line: `OCCUPIED / EMPTY / UNKNOWN`, front `Y/-`, back `Y/?`,
+probabilities, motion value vs threshold, and while occupied which evidence is
+holding it (`held by ... clears in N s`). Warm-up is 30 s (someone arriving
+shows `OCCUPIED (motion)` immediately); `EMPTY` is reported ~60-75 s after
+everyone leaves (30 s window + 45 s hold -- a missed occupant is treated as worse
+than a false alarm). Health warnings (setup moved, sensor signal changed, stale
+calibration) turn `EMPTY` into `UNKNOWN`.
+
+#### Calibration and self-test
+```powershell
+# calibrate only (~3 min): empty 40 s + one person per seat 30 s
+python x7_presence_setup.py calibrate --host1 529 --host2 545
+
+# quick self-test (~4 min): empty, seats 3, 4, 1, 2 -- no recalibration
+python x7_presence_setup.py selftest --host1 529 --host2 545
+
+# full self-test (~8.5 min): longer steps, all four seats, and occupied -> EMPTY clearing
+python x7_presence_setup.py selftest --host1 529 --host2 545 --full --all-seats
+
+# rerun only chosen steps (each failed report prints this line for you)
+python x7_presence_setup.py selftest --host1 529 --host2 545 --steps 3 empty
+```
+Useful options: `--leave-s` (countdown to clear the seats, default 15),
+`--empty-s`, `--seat-s`, `--calib`, `--report-dir` (default `selftest_reports/`).
+
+**Offline** (runs the same procedures on recordings -- for testing the code, not
+the setup; use a scratch `--calib` so the real calibration is not overwritten):
+```powershell
+python x7_presence_setup.py check     --from-files human_dataset_v3 --calib scratch_calib.json
+python x7_presence_setup.py calibrate --from-files human_dataset_v3 --out scratch_calib.json
+python x7_presence_setup.py selftest  --from-files human_dataset_v3 --calib scratch_calib.json
+python test_presence_setup.py        # simulated radar moves / sensor fault: 10 checks
+```
+
+#### Training and evaluation
+```powershell
+# the command that produced the current models/presence_zone.json (36 parameters)
+python x7_presence_zone.py train --data human_dataset_v2 human_dataset_v3 --window 3 --exit-s 45
+
+# explore window lengths (in 10 s blocks) and skip the no-seat control
+python x7_presence_zone.py train --data human_dataset_v2 human_dataset_v3 --windows 1 2 3 6 --no-control
+
+# state-machine replay (latencies, missed-occupant rate) on recordings
+python x7_presence_zone.py replay --model models/presence_zone_v2only.json --files "human_dataset_v3/*/*.npy" --runs 20 --run-len 18
+
+# cross-day bridge test: train on v2, test on the v3 day (zone model, count CNN, seat CNN, controls)
+python x7_presence_bridge_eval.py --zone-model models/presence_zone_v2only.json
+```
+After retraining, rerun `check` -- a calibration made with a different model is
+flagged as stale.
+
+#### Recording a presence dataset
+```powershell
+python x7_2s_record_presence.py --host1 529 --host2 545 --seats 4 --out human_dataset_v4 --trials 6 --block 1 --empty-trials 18
+```
+Answer `all` to the occupancy and arrangement prompts, and give a new subject
+ID. Run the recorder **once** for the whole session (do not restart it per
+scenario): it interleaves every scenario in reshuffled rounds, spreads the empty
+trials through the session, and with `--block 1` prompts everyone to stand up and
+re-seat before every trial -- each trial is then an independent sit-down.
+Options: `--fps` (default 5), `--seconds` (default 10), `--countdown`,
+`--countdown-empty` (default 15), `--preset`.
+
+**Gate the dataset before training on it:**
+```powershell
+python check_confound.py --data human_dataset_v2 human_dataset_v3 human_dataset_v4
+```
+`NOT INTERPRETABLE` = occupancy is aliased with the recording session;
+`PARTIAL` = only leave-one-day-out testing is valid; `usable` = classes are mixed
+within sittings.
+
+---
+
+### 2. 3D Gesture Recognition (v3)
+
+#### Live detection
+```powershell
+python x7_gesture_live.py --host1 529 --host2 545 --calibrate 0
+python x7_gesture_live.py --host1 529 --host2 545 --calibrate 0 --log gesture_live_log   # save every capture
+```
+Uses `models/gesture_v3.json` (check the `model ...` line in the header).
+See Section 4.5 for why the Oct 5 relabelled model was dropped. Keep still until "warming up"
+finishes (3 s), then swipe naturally. The confidence and margin floors come from
+the model (0.65 / 0.40); override them with `--confidence` and `--margin`.
+`--model PATH` selects another model. Output:
+`>>> SWIPE_LR (97.3%) [4 ms]`, or `ignored: not a gesture / low confidence ...`.
+Other options: `--trigger-x` (default 6), `--timeout` (s per calibration
+prompt).
+
+**Session calibration** is not needed on this setup (the base model holds
+across days). `--calibrate N` asks for N captures per class, saves them to
+`gesture_dataset_v3/` as session `C…` (automatic trigger, as in live), and
+fine-tunes the ensemble in a
+separate process (~15 s; Ctrl+C skips). It raises the confidence floor to at
+least 0.8, which cancels the margin floor's gain; `--no-save-calibration`
+discards the captures.
+
+#### Recording a session
+```powershell
+python x7_gesture_record.py --host1 529 --host2 545 --per-gesture 8 --no-gesture 20
+```
+After each GO, do the gesture **naturally, the way you do it in live use**.
+The automatic trigger captures it exactly as live detection does.
+
+* After each swipe the line `model sees ...` shows the current model's
+  reading. `!! looks like the OPPOSITE swipe` means redo it with `x`.
+  `--check-model PATH` chooses the model for this check; `--check-model ""`
+  turns it off.
+* `--manual` arms each capture with Enter (hand still at the start). It
+  captures only the stroke and does not match live detection, so it is for
+  experiments only.
+* `--gestures SWIPE_LR SWIPE_RL` records only those gestures, e.g. a live-style
+  test that stays out of the dataset:
+  `--gestures SWIPE_LR SWIPE_RL --per-gesture 6 --no-gesture 0 --block 1 --out live_style_test`.
+* Gestures come in shuffled blocks of 2 (`--block`), never the same label
+  twice in a row. The session ID defaults to `G` + month/day/hour/minute.
+* Press `x` at the next prompt to discard the last capture and redo it;
+  Ctrl+C stops and keeps everything saved.
+* A gesture that does not trigger within `--timeout` s (default 8) is asked
+  again, up to 3 times.
+* No calibration is needed before recording, only the warm-up.
+* Record each session as a new sitting. Vary the seat position (±10 cm)
+  between sessions, and the NO_GESTURE movements within one.
+
+#### Training
+```powershell
+python x7_gesture_train.py --target-precision 0.9 --out models/_trial_new.json   # trial (~12 min)
+python x7_gesture_train.py --target-precision 0.9                                # overwrites gesture_v3
+```
+* Trains on every session in `gesture_dataset_v3/`, prints the held-out
+  accuracy per session, the confusion matrix and a floor table, then trains
+  the final 3-model ensemble on all data.
+* It **overwrites** `models/gesture_v3.*`; use `--out` for a trial model.
+* Options: `--channels {angle,angle+amp,angle+amp+doppler}`, `--no-reverse`,
+  `--epochs` (60), `--seeds` (3), `--data`, `--pretrain-corpus DIR`
+  (measured to hurt).
+* The default `--target-precision` is still 0.95, which picks a floor too
+  strict for live use (17-44% recall). Pass 0.9.
+* Before promoting a trial model, score it on `live_style_test/` (natural
+  left/right swipes captured the live way); `gesture_v3` gets 9/12.
+* To promote a trial: back up `models/gesture_v3*`, then retrain without `--out`
+  (or copy the trial files over the `gesture_v3` names and edit the `weights`
+  list inside the json to match).
+
+#### Legacy (`x7_2s_*`, earlier mountings -- reference only)
+```powershell
+python x7_2s_live.py --host1 529 --host2 545                     # m5_now ensemble
+python x7_2s_debug_live.py --host1 529 --host2 545 --label SWIPE_LR --session s3
+python x7_2s_train.py --classes 5 --checkpoint best_model_2s_5class_new.pth --epochs 80
+python x7_2s_eval.py --model models\best_model_2s_5class.pth --mode split
+```
+
+---
+
+### 3. Superseded presence tools (reference only)
+
+The count-CNN presence pipeline below was found to learn the **recording
+session, not the occupants**: every occupancy level had been recorded on its own
+day, and the same architecture scored 99.7% on v2 but **45%** on a new day
+(see `documentation/2026-09-21.md` and `2026-09-25.md`). The datasets its
+defaults point to (`human_dataset_2s_*`) no longer exist. Kept for reference;
+do not use for results.
+```powershell
+python x7_2s_live_presence.py --host1 529 --host2 545                        # count CNN, live
+python x7_2s_train_presence.py --data <dir> --val_data <dir> --epochs 40      # count CNN training
+python x7_2s_eval_presence.py --data <dir> --model models/best_model_2s_presence.pth
+python x7_2s_synthesize_data.py --src <dir> --target_per_class 600            # synthetic augmentation
+python x7_2s_train_presence_seats.py --data human_dataset_v2                  # per-seat CNN (chance across days)
+```
+
+---
+
+## 7. Repository Map
+
+**Shared**
+| file | purpose |
+|---|---|
+| `x7_physics.py` | single source of truth: measured range map, wavelength, baselines, phasor/MTI helpers |
+| `probe_range.py` | prints the bin count, range offset and bin length the radar reports |
+| `x7_acq_worker.py` | radar in its own process; orphan watchdog; USB/stale-process preflight |
+
+**Occupancy (current)**
+| file | purpose |
+|---|---|
+| `x7_presence_zone.py` | zone model: features, training (`train`), `replay`, `live`, health monitor |
+| `x7_presence_setup.py` | `check` (daily), `calibrate`, `selftest` -- live or `--from-files` |
+| `x7_2s_record_presence.py` | interleaved, re-seating dataset recorder |
+| `check_confound.py` | dataset gate: are occupancy levels aliased with sessions? |
+| `x7_presence_bridge_eval.py` | train on one dataset, test on a different day, all models + controls |
+| `test_presence_setup.py` | offline checks for calibration and the setup-change monitor |
+| `models/presence_zone.json` | deployed zone model (v2 + v3, 30 s window, 45 s hold) |
+| `models/presence_zone_v2only.json` | v2-only fit used for the cross-day bridge test |
+| `models/presence_calib.json` | current live calibration (`_prev.json` = previous) |
+| `human_dataset_v2/`, `human_dataset_v3/` | recordings (v2: one level per day, 799; v3: all levels on Sep 25, 108) |
+| `selftest_reports/` | JSON reports from `check` and `selftest` |
+
+**Gesture (current, v3)**
+| file | purpose |
+|---|---|
+| `x7_gesture_core.py` | constants, trigger (`Segmenter`), Enter wait (`wait_for_enter`), features, model, `GestureModel` (decision rule) |
+| `x7_gesture_record.py` | shuffled session recorder: automatic trigger (as live; `--manual` = Enter), direction check, `--gestures` |
+| `x7_gesture_train.py` | leave-one-session-out training, floor selection, ensemble |
+| `x7_gesture_live.py` | live recognition, optional session calibration |
+| `models/gesture_v3.json` + `gesture_v3_seed{0,1,2}.pt` | **deployed model** (Sep 30, 7 sessions, floors 0.65 / 0.40) |
+| `models/*_heldout.npz` | held-out predictions from each training run |
+| `models/_unswap_LRRL_20261012_log.json` | rename log of the Oct 12 undo of the Oct 5 relabelling |
+| `gesture_dataset_v3/` | training recordings (automatic trigger), `LABEL_SESSION_ts_idx.npy`, 64 x 2 x 2 x 2 x 34 complex; 7 sessions |
+| `gesture_dataset_enter_style/` | the two Oct 5 sessions (G10051022, G10051151), Enter-style captures; not trained on |
+| `live_style_test/` | 12 natural LR/RL swipes, automatic trigger (Oct 12); **the** left/right test set |
+| `direction_test/` | 10 deliberate Enter-armed LR/RL swipes (Oct 5); test set for the Enter style |
+| `gesture_live_rl/`, `gesture_live_corrected/` | logged live captures from the Oct 5 tests |
+| `x7_2s_record.py` | still provides the gesture radar class used by `x7_acq_worker` |
+
+**Gesture (superseded):** `x7_2s_live.py`, `x7_2s_debug_live.py`, `x7_2s_train.py`,
+`x7_2s_eval.py`, `models/m5_now_seed{0,1,2}.pth`, `models/best_model_2s_5class.pth`,
+`debug_captures/` (315 windows from earlier mountings).
+
+**Superseded (reference only):** `x7_2s_live_presence.py`, `x7_2s_train_presence.py`,
+`x7_2s_eval_presence.py`, `x7_2s_synthesize_data.py`, `x7_2s_train_presence_seats.py`,
+`models/presence_seats.pth`. `architecture.mmd` still describes the earlier design
+(8 gesture channels, 50 ms timestamp gate, count-CNN presence) and has not been
+updated.
+
+---
+
+## 8. Engineering Log
+
+Dated entries in [`documentation/`](./documentation/), each with objective,
+measurements, errors found (including our own), current state and lessons:
+
+| date | topic |
+|---|---|
+| 2026-09-04 | full audit; augmentation noise, evaluation on training data, 339-bin padding |
+| 2026-09-08 | live gesture debugging; PINCH removed; class-name inversion; 5-class ensemble |
+| 2026-09-10 | range constant wrong by 11x; boards rolled 45 deg; re-mount; recorder rewrite |
+| 2026-09-11 | presence audit; stale constants; the "3 people max" question |
+| 2026-09-15 | first presence recordings; car seating; AoA channels (and the recording plan that caused the confound) |
+| 2026-09-16 | 2-person recordings; later shown to be one block per sit-down |
+| 2026-09-21 | the 99.7% that meant nothing; interleaved recorder; GIL fix; FTDI lock |
+| 2026-09-22 | instrument stability; seat and breathing physics; scope: room PoC |
+| 2026-09-24 | sit-down memorisation; energy and breathing tests; zone model built |
+| 2026-09-25 | bridging session; cross-day validation; calibration, monitor and self-test |
+| 2026-09-28 | first live calibration; faster `check` routine; README rewrite; gesture review: each board is a one-axis array |
+| 2026-09-29 | gesture v3 pipeline (record/train/live); 4 sessions, 41% → 77% held-out; threshold, fine-tuning and trigger fixes |
+| 2026-09-30 | gesture: holds across days (83% frozen model); 7 sessions, margin floor, 90% precision / 77% recall; seat-shift and SWIPE_RL analysis |
+| 2026-10-05 | September left/right labels judged reversed and relabelled (undone Oct 12, see Section 4.5); manual Enter trigger; direction test |
+| 2026-10-12 | Oct 5 relabelling found wrong and undone (live-style test 9/12 vs 0/12); recorder back to automatic trigger; presence recalibrated (+3 bins), empty step fails |
+
+**Lessons that shaped the current design**
+* Run the control before reporting the number: a classifier on empty range
+  bins scoring 99.7% was the real result.
+* Count independent samples, not files -- 799 recordings were ~16 sit-downs.
+* Put invariance in the measurement (ratios, whitening, calibration), not in a
+  model trained on too little variation.
+* Verify the antenna model before interpreting angles: the "vertical"
+  baseline never existed, and a one-line test (do the cross elements move?)
+  showed it.
+* For gestures, more sessions beat more repetitions, and model changes were
+  within noise: vary what varies in real use (sitting, seat position,
+  non-gestures).
+* Test against ground truth that matches real use: ten deliberate,
+  Enter-armed swipes were taken as ground truth and led to relabelling data
+  that was right for natural swipes. Twelve natural swipes captured the live
+  way showed the error (Oct 12).
+* Encode the safety asymmetry in the state machine: recall targets, holds,
+  `UNKNOWN` and `SENSOR FAULT` are what make "a missed occupant is worse" true.

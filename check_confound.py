@@ -139,6 +139,21 @@ def main():
 
     aliased = [c for c in classes
                if len({s for s in sittings if grid[(s, c)]}) == 1]
+
+    # Several sittings per class is not enough: a class spread over sittings
+    # that each hold only that class is still aliased with its sittings.
+    # What makes a test possible is a sitting (or at least a day) that holds
+    # several classes.
+    day = np.array([__import__("datetime").datetime.fromtimestamp(p[3]).strftime("%m-%d")
+                    for _, p in parsed])
+    mixed_sit = [s for s in sittings
+                 if len({c for c in classes if grid[(s, c)]}) >= 2]
+    day_cls = {d: sorted(set(lab[day == d].tolist())) for d in sorted(set(day.tolist()))}
+    mixed_day = [d for d, cs in day_cls.items() if len(cs) >= 2]
+    print("\n   classes per calendar day: "
+          + "  ".join(f"{d}:{''.join(map(str, cs))}" for d, cs in day_cls.items()))
+    print(f"   sittings holding >= 2 classes: {len(mixed_sit)}   "
+          f"days holding >= 2 classes: {len(mixed_day)}")
     if aliased:
         print(f"\n   FAIL: class(es) {aliased} appear in exactly one sitting each.")
         print("         Label and session are aliased; no split can separate them.")
@@ -192,8 +207,14 @@ def main():
               f"r(time, far energy) = {r:+.2f}   {note}")
 
     print("\n" + "=" * 66)
-    ok = not aliased
-    if ok:
+    ok = not aliased and bool(mixed_sit or mixed_day)
+    if ok and not mixed_sit:
+        print(" VERDICT: PARTIAL. A day holds several classes, so a model trained on")
+        print("          other days can be tested on it (leave-one-day-out) -- but no")
+        print("          sitting mixes classes, so every class is still one block in")
+        print("          time. Do not evaluate within a day.")
+        print(f"          mixed days: {', '.join(mixed_day)}")
+    elif ok:
         print(" VERDICT: usable. Every class spans more than one sitting, so a")
         print("          session-aware split can test generalisation honestly.")
         if max_r > 0.6:

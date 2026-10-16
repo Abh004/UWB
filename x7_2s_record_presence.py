@@ -312,7 +312,15 @@ def run_session(args, radar):
 
     block = max(1, min(args.block, trials))
     n_rounds = (trials + block - 1) // block
-    total = len(plan) * trials
+    EMPTY = (0, ())
+    # The empty cabin can get more trials than the other scenarios. Its extra
+    # visits are spread over every round, so it never ends up as one block.
+    target = {sc: trials for sc in plan}
+    if EMPTY in target and args.empty_trials:
+        target[EMPTY] = max(1, args.empty_trials)
+    empty_per_round = (-(-target.get(EMPTY, 0) // (block * n_rounds))
+                       if EMPTY in target else 0)
+    total = sum(target.values())
 
     # Tag every file with the sitting it came from, so the confound check is
     # exact instead of inferred from timestamp gaps.
@@ -322,6 +330,10 @@ def run_session(args, radar):
     print("\n" + "=" * 62)
     print(f" {len(plan)} scenario(s) x {trials} trial(s) = {total} recordings")
     print(f" interleaved: {n_rounds} round(s), {block} back-to-back trial(s) per visit")
+    if EMPTY in target:
+        print(f" empty cabin: {target[EMPTY]} trial(s), {empty_per_round} visit(s) per round")
+    if block == 1:
+        print(" block 1: every trial is its own sit-down -- RE-SEAT before each one")
     print(f" {args.seconds:.0f}s each -> about {total * (args.seconds + 4) / 60:.0f} min")
     print(f" sitting id {sitting}")
     if len({k for k, _ in plan}) < 2:
@@ -333,11 +345,20 @@ def run_session(args, radar):
 
     out_root = Path(args.out)
     done = 0
-    remaining = {sc: trials for sc in plan}
+    remaining = dict(target)
 
     for rnd in range(n_rounds):
-        order = [sc for sc in plan if remaining[sc] > 0]
+        order = [sc for sc in plan if remaining[sc] > 0 and sc != EMPTY]
+        if EMPTY in remaining and remaining[EMPTY] > 0:
+            left_rounds = n_rounds - rnd
+            visits = -(-remaining[EMPTY] // (block * left_rounds))
+            order += [EMPTY] * visits
         random.shuffle(order)
+        # keep repeated empty visits apart where possible
+        for _ in range(50):
+            if all(not (a == b == EMPTY) for a, b in zip(order, order[1:])):
+                break
+            random.shuffle(order)
         print("\n" + "=" * 62)
         print(f" ROUND {rnd + 1}/{n_rounds}   ({len(order)} scenario(s) this round)")
         print("=" * 62)
@@ -346,12 +367,19 @@ def run_session(args, radar):
             sc = (n_people, seats)
             tag = scenario_tag(n_people, seats)
             k = min(block, remaining[sc])
+            if k <= 0:
+                continue
             where = "EMPTY -- everyone out of the cabin" if n_people == 0 else \
                     f"{n_people} person(s) in seat(s) {','.join(map(str, seats))}"
             print("\n" + "-" * 62)
             print(f" SCENARIO: {where}")
             print(f" round {rnd + 1}/{n_rounds}, {k} trial(s) now, "
-                  f"{remaining[sc]} of {trials} left overall")
+                  f"{remaining[sc]} of {target[sc]} left overall")
+            if n_people == 0:
+                print(" -> occupants leave the room (or the same far spot every time);")
+                print("    the operator stays exactly where they always are")
+            else:
+                print(" -> EVERYONE stand up and sit back down, even if already in this seat")
             print("-" * 62)
             ans = input(" Position everyone, then press Enter "
                         "('s' skip this visit, 'q' end session): ").strip().lower()
@@ -369,8 +397,8 @@ def run_session(args, radar):
             # operator included, so it gets a longer countdown.
             cd = args.countdown_empty if n_people == 0 else args.countdown
             for t in range(k):
-                idx = trials - remaining[sc] + 1
-                print(f"  trial {idx}/{trials}")
+                idx = target[sc] - remaining[sc] + 1
+                print(f"  trial {idx}/{target[sc]}")
                 for c in range(cd, 0, -1):
                     sys.stdout.write(f"\r    starting in {c}...  ")
                     sys.stdout.flush()
@@ -402,6 +430,9 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="human_dataset_v2", help="Output directory")
     parser.add_argument("--seats", type=int, default=4, help="Number of seats (default 4)")
     parser.add_argument("--trials", type=int, default=10, help="Default trials per scenario")
+    parser.add_argument("--empty-trials", dest="empty_trials", type=int, default=None,
+                        help="Trials for the empty cabin (default: same as the other "
+                             "scenarios). Extra empty visits are spread over every round.")
     parser.add_argument("--countdown", type=int, default=3,
                         help="Countdown seconds before each trial (default 3)")
     parser.add_argument("--countdown-empty", dest="countdown_empty", type=int,
