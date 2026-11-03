@@ -1,108 +1,81 @@
 %% =============================================================================
-%% NOVELDA X7 DUAL-SENSOR RADAR AI ARCHITECTURE
-%% 1. 3D Gesture Recognition Pipeline (Late Fusion Siamese CNN)
-%% 2. 5-Class Presence / Occupancy Detection Pipeline (GPU-Accelerated 2D CNN)
+%% NOVELDA X7 DUAL-SENSOR IN-CABIN RADAR ARCHITECTURE (current implementation)
+%% 1. Occupancy: physics front end + 3 logistic regressions (36 params)
+%%    x7_presence_zone.py, x7_presence_setup.py, models/presence_zone.json
+%% 2. Gesture: peak-driven trigger + two-branch CNN ensemble (113,606 params)
+%%    x7_gesture_core.py, models/gesture_v3.json
+%% Only one pipeline runs at a time, each with its own radar preset.
 %% =============================================================================
 
 graph TB
     %% -------------------------------------------------------------------------
-    %% TOP LEVEL SYSTEM INPUTS
+    %% SHARED HARDWARE AND ACQUISITION
     %% -------------------------------------------------------------------------
-    subgraph HARDWARE ["Hardware Layer: Novelda X7 Dual UWB Radars"]
-        R1["Radar Sensor 1<br/>(Front Array - TX0/TX1, RX0/RX1)"]
-        R2["Radar Sensor 2<br/>(Side Array - TX0/TX1, RX0/RX1)"]
+    subgraph HW ["Hardware: 2 x Novelda X7 IR-UWB radar"]
+        R1["Radar 1<br/>2 TX x 2 RX (one-axis line array)"]
+        R2["Radar 2<br/>2 TX x 2 RX (one-axis line array)"]
     end
 
-    subgraph SDK ["Novelda X7 SDK Ingestion & Synchronization"]
-        SDK1["RadarDirectCallback (Sensor 1)<br/>Baseband Complex IQ Frame Assembly"]
-        SDK2["RadarDirectCallback (Sensor 2)<br/>Baseband Complex IQ Frame Assembly"]
-        SYNC["Software FIFO Queue & Sequence Synchronizer<br/>Tolerance: dt < 50ms"]
-    end
+    ACQ["Acquisition child process (x7_acq_worker)<br/>holds SDK + GIL, pairs frames by sequence,<br/>parent watchdog; frames over a pipe"]
 
-    R1 --> SDK1
-    R2 --> SDK2
-    SDK1 --> SYNC
-    SDK2 --> SYNC
+    R1 --> ACQ
+    R2 --> ACQ
 
     %% -------------------------------------------------------------------------
-    %% PIPELINE 1: 3D GESTURE RECOGNITION PIPELINE
+    %% PIPELINE 1: OCCUPANCY
     %% -------------------------------------------------------------------------
-    subgraph GESTURE_PIPELINE ["Pipeline 1: 3D Gesture Recognition (64 Frames, 34 Bins)"]
+    subgraph OCC ["Occupancy: 5 fps, 112 bins, 30 s window (3 x 10 s blocks)"]
         direction TB
-        G_INPUT["Dual Virtual Frame Stream<br/>Shape: (64, 2, 2, 2, 34) complex64"]
-        
-        subgraph G_DSP ["Interferometric Signal Processing (Per Sensor)"]
-            G_MTI["1. MTI Static Clutter Subtraction<br/>w_mti = w - mean(w, axis=0)"]
-            G_H["2. Horizontal AoA Unit Phasor<br/>H = (TX0_RX0 * conj(TX1_RX0)) / |interf|"]
-            G_V["3. Vertical AoA Unit Phasor<br/>V = (TX0_RX0 * conj(TX0_RX1)) / |interf|"]
-            G_D["4. Temporal Doppler Velocity Phasor<br/>D(t) = (TX0_RX0(t) * conj(TX0_RX0(t-1))) / |interf|"]
-            G_AMP["5. Normalized Amplitude & Spatial Energy<br/>amp_norm, amp_H_norm"]
-            G_STACK["6. 8-Channel Physical Tensor Stack<br/>Shape per sensor: (8, 34, 64)"]
-        end
+        O_IN["Frame buffer<br/>(150, 2, 2, 2, 112) complex"]
+        O_DT["1. Quadratic detrend over time<br/>(MTI + drift removal)"]
+        O_FFT["2. FFT over time<br/>breathing 0.2-0.5 Hz, noise 0.8-2.5 Hz"]
+        O_REF["3. Reference floor<br/>bins behind the antenna"]
+        O_ZONE["4. Zones: front 0.35-1.05 m, back 1.25-2.0 m<br/>(shifted by calibration / auto-alignment)"]
+        O_WH["5. Whiten 8 virtual channels x zone bins<br/>by each element's noise-band power"]
+        O_FEAT["6. 11 features<br/>per zone: eig vs Marchenko-Pastur edge, ncomp,<br/>snr, br, motion; + front/back coherence"]
+        O_LR["3 logistic regressions (12 params each = 36)<br/>occupied, front, back<br/>thresholds for >= 99% recall"]
+        O_SM["Asymmetric state machine<br/>enter immediately, hold 45 s after last evidence;<br/>UNKNOWN in warm-up, SENSOR FAULT on stall"]
+        O_HM["Health monitor<br/>noise vs calibration (6 dB),<br/>front-row drift (10 cm) -> auto-align"]
+        O_OUT["Decision every 1 s<br/>EMPTY / OCCUPIED, front row, back row"]
 
-        subgraph G_NET ["GestureCNN_X7_Dual (Late Fusion Siamese Architecture)"]
-            subgraph G_B1 ["Branch 1: Sensor 1 Spatial Feature Extractor"]
-                B1_C1["Conv2D(8->64, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
-                B1_C2["Conv2D(64->128, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
-                B1_C3["Conv2D(128->256, 3x3) + BN + ReLU + MaxPool(2)"]
-                B1_C4["Conv2D(256->512, 3x3) + BN + ReLU"]
-                B1_P["AdaptiveAvgPool2d((4, 4)) -> 8,192 features"]
-            end
-
-            subgraph G_B2 ["Branch 2: Sensor 2 Spatial Feature Extractor"]
-                B2_C1["Conv2D(8->64, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
-                B2_C2["Conv2D(64->128, 3x3) + BN + ReLU + MaxPool(2) + Drop(0.1)"]
-                B2_C3["Conv2D(128->256, 3x3) + BN + ReLU + MaxPool(2)"]
-                B2_C4["Conv2D(256->512, 3x3) + BN + ReLU"]
-                B2_P["AdaptiveAvgPool2d((4, 4)) -> 8,192 features"]
-            end
-
-            G_CAT["Feature Concatenation Layer<br/>16,384 Fused Dual-Sensor Features"]
-            G_FC1["Linear(16384 -> 512) + ReLU + Dropout(0.5)"]
-            G_FC2["Linear(512 -> 128) + ReLU + Dropout(0.3)"]
-            G_OUT["Linear(128 -> 7 Classes)<br/>SWIPE_LR, SWIPE_RL, SWIPE_UP, SWIPE_DOWN, PUSH_IN, PINCH, NOISE"]
-        end
+        O_IN --> O_DT --> O_FFT
+        O_FFT --> O_REF & O_ZONE
+        O_ZONE --> O_WH
+        O_REF & O_WH --> O_FEAT
+        O_FEAT --> O_LR --> O_SM --> O_OUT
+        O_HM -.-> O_ZONE
+        O_HM -.-> O_SM
     end
 
-    SYNC --> G_INPUT
-    G_INPUT --> G_MTI
-    G_MTI --> G_H & G_V & G_D & G_AMP
-    G_H & G_V & G_D & G_AMP --> G_STACK
-    G_STACK --> B1_C1 & B2_C1
-    B1_C1 --> B1_C2 --> B1_C3 --> B1_C4 --> B1_P
-    B2_C1 --> B2_C2 --> B2_C3 --> B2_C4 --> B2_P
-    B1_P & B2_P --> G_CAT
-    G_CAT --> G_FC1 --> G_FC2 --> G_OUT
-
     %% -------------------------------------------------------------------------
-    %% PIPELINE 2: 5-CLASS OCCUPANCY & PRESENCE DETECTION PIPELINE
+    %% PIPELINE 2: GESTURE
     %% -------------------------------------------------------------------------
-    subgraph PRESENCE_PIPELINE ["Pipeline 2: 5-Class Human Presence Detection (50 Frames, 339 Bins)"]
+    subgraph GES ["Gesture: 40 fps, 34 bins (14 physical, 0.05-0.98 m), 64-frame window"]
         direction TB
-        P_INPUT["Dual Sensor Stream Buffer<br/>Shape: (B, 50, 2, 2, 2, 339) complex64"]
+        G_SEG["Segmenter<br/>moving energy in hand bins / noise floor;<br/>trigger at 6x idle level, peak + 40 frames, cooldown"]
+        G_WIN["Captured window<br/>(64, 2, 2, 2, 14) complex"]
+        G_MTI["MTI: subtract window mean"]
+        G_ANG["Coherent angle phasor<br/>4 single-baseline pairs averaged (Re, Im)"]
+        G_AMP["MTI amplitude<br/>z-scored within window"]
+        G_X["Per sensor: (3, 14 bins, 64 frames)"]
 
-        subgraph P_GPU_DSP ["Vectorized GPU Preprocessing (CUDA Tensors)"]
-            P_MTI["1. Vectorized Temporal MTI Subtraction<br/>w_mti = w - mean(w, dim=1, keepdim=True)"]
-            P_MAG["2. Complex Magnitude & 2TX x 2RX Averaging<br/>mag = |w_mti|, mag_avg = mean(mag, dim=(3,4))"]
-            P_LOG["3. Log-Amplitude Scaling<br/>mag_scaled = ln(1 + 100 * mag_avg)"]
-            P_PERM["4. Channel Permutation -> PyTorch Tensor<br/>Shape: (B, 2 Channels, 50 Frames, 339 Bins)"]
+        subgraph G_NET ["Two-branch CNN, one branch per board (113,606 params)"]
+            G_B1["Branch 1<br/>Conv 3->16 + BN + ReLU, MaxPool(1,2)<br/>Conv 16->32 + BN + ReLU, MaxPool(2)<br/>Conv 32->64 + BN + ReLU<br/>AdaptiveAvgPool(1,8) -> 512"]
+            G_B2["Branch 2<br/>same layout, separate weights<br/>-> 512"]
+            G_HEAD["Concat 1024 -> Dropout 0.3<br/>Linear 1024->64 + ReLU, Dropout 0.2<br/>Linear 64->6"]
         end
 
-        subgraph P_NET ["PresenceCNN_X7_Dual Architecture"]
-            P_BLK1["Block 1: Conv2D(2->16, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (16, 25, 169)"]
-            P_BLK2["Block 2: Conv2D(16->32, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (32, 12, 84)"]
-            P_BLK3["Block 3: Conv2D(32->64, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (64, 6, 42)"]
-            P_BLK4["Block 4: Conv2D(64->128, 3x3, pad=1) + BN + ReLU + MaxPool(2)<br/>Output: (128, 3, 21)"]
-            P_GAP["AdaptiveAvgPool2d((1, 1)) -> (128, 1, 1)"]
-            P_DENSE["Flatten() -> Dropout(0.3) -> Linear(128 -> 5)"]
-            P_OUT["Softmax Probabilities (5 Occupancy States)<br/>0_people, 1_people, 2_people, 3_people, 4_people"]
-        end
+        G_ENS["Ensemble: softmax averaged over 3 seeds"]
+        G_DEC["Decision floors<br/>confidence >= 0.65, margin >= 0.40;<br/>NO_GESTURE rejected"]
+        G_OUT["SWIPE_LR, SWIPE_RL, SWIPE_UD,<br/>SWIPE_DU, PUSH_IN (or nothing)"]
+
+        G_SEG --> G_WIN --> G_MTI
+        G_MTI --> G_ANG & G_AMP
+        G_ANG & G_AMP --> G_X
+        G_X --> G_B1 & G_B2
+        G_B1 & G_B2 --> G_HEAD
+        G_HEAD --> G_ENS --> G_DEC --> G_OUT
     end
 
-    SYNC --> P_INPUT
-    P_INPUT --> P_MTI
-    P_MTI --> P_MAG
-    P_MAG --> P_LOG
-    P_LOG --> P_PERM
-    P_PERM --> P_BLK1
-    P_BLK1 --> P_BLK2 --> P_BLK3 --> P_BLK4 --> P_GAP --> P_DENSE --> P_OUT
+    ACQ -- "occupancy preset" --> O_IN
+    ACQ -- "gesture preset" --> G_SEG
