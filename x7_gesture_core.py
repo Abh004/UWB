@@ -56,8 +56,8 @@ IDLE_UPDATE_FRAMES = 40           # re-estimate once a second
 
 GESTURES = ["SWIPE_LR", "SWIPE_RL", "SWIPE_UD", "SWIPE_DU", "PUSH_IN", "NO_GESTURE"]
 DESCRIPTION = {
-    "SWIPE_LR": "swipe LEFT -> RIGHT",
-    "SWIPE_RL": "swipe RIGHT -> LEFT",
+    "SWIPE_LR": "hand still on your LEFT, pause, then swipe LEFT -> RIGHT",
+    "SWIPE_RL": "hand still on your RIGHT, pause, then swipe RIGHT -> LEFT",
     "SWIPE_UD": "swipe UP -> DOWN",
     "SWIPE_DU": "swipe DOWN -> UP",
     "PUSH_IN": "PUSH toward the radar",
@@ -347,7 +347,8 @@ class GestureModel:
         if name == "NO_GESTURE":
             return None, conf, "not a gesture"
         th = self.meta["thresholds"]
-        if conf < th["confidence"] or margin < th["margin"]:
+        floor = th.get("class_confidence", {}).get(name, th["confidence"])
+        if conf < floor or margin < th["margin"]:
             return None, conf, (f"low confidence ({name} {conf * 100:.0f}%, "
                                 f"margin {margin * 100:.0f}%)")
         return name, conf, ""

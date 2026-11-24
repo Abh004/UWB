@@ -187,7 +187,7 @@ def report(P, y, classes, th, title):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", nargs="+", default=["gesture_dataset_v3"])
+    ap.add_argument("--data", nargs="+", default=["gesture_dataset_v4_pause"])
     ap.add_argument("--raw-corpus", dest="raw_corpus", default=None,
                     help="also/only use old 100-frame corpus recordings (dir with G0x_* folders)")
     ap.add_argument("--pretrain-corpus", dest="pretrain_corpus", default=None,
@@ -204,11 +204,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--target-precision", dest="target", type=float, default=0.95)
-    ap.add_argument("--out", default=os.path.join("models", "gesture_v3.json"))
+    ap.add_argument("--out", default=os.path.join("models", "gesture_v4_pause.json"))
     args = ap.parse_args()
 
-    items = [] if args.raw_corpus and args.data == ["gesture_dataset_v3"] and \
-        not os.path.isdir("gesture_dataset_v3") else load_windows(args.data)
+    items = [] if args.raw_corpus and args.data == ["gesture_dataset_v4_pause"] and \
+        not os.path.isdir("gesture_dataset_v4_pause") else load_windows(args.data)
     if args.raw_corpus:
         items += load_raw_corpus(args.raw_corpus)
     if not items:

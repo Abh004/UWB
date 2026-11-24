@@ -141,7 +141,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host1", required=True)
     ap.add_argument("--host2", required=True)
-    ap.add_argument("--out", default="gesture_dataset_v3")
+    ap.add_argument("--out", default="gesture_dataset_v4_pause")
     ap.add_argument("--session", default=None,
                     help="session id (default: G + date/time); use a new one each sitting")
     ap.add_argument("--per-gesture", dest="per_gesture", type=int, default=10)
@@ -159,7 +159,7 @@ def main():
     ap.add_argument("--auto", action="store_true",
                     help="automatic trigger (the default; kept for older command lines)")
     ap.add_argument("--check-model", dest="check_model",
-                    default=os.path.join("models", "gesture_v3.json"),
+                    default=os.path.join("models", "gesture_v4_pause.json"),
                     help="model used to flag captures that look like the opposite swipe ('' = off)")
     args = ap.parse_args()
     args.auto = not args.manual

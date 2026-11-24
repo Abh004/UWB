@@ -12,7 +12,7 @@ Two Novelda X7 IR-UWB radars (2 TX x 2 RX each) drive two pipelines:
 | pipeline | what it does | status |
 |---|---|---|
 | **Occupancy (zone model)** | occupied / empty, front-row and back-row occupancy, from breathing and motion | **Proof of concept validated across days.** Occupied/empty and front row: AUC 1.000, 0% false alarm on a held-out day. Back row: indicator only. Per-person counting: not supported by this sensor geometry. |
-| **3D gesture recognition** | 5 directional gestures + "no gesture", continuous, no activation gesture | **v3, rebuilt Sep 29.** Deployed `models/gesture_v3.json` (7 sessions): 82.3% held-out accuracy, 90.2% precision with 76.6% of gestures recognised; **9/12** on natural left/right swipes captured the live way (Oct 12). Training data must be captured the way live captures it: Enter-armed deliberate swipes look like the *opposite* swipe (Section 4.5). |
+| **3D gesture recognition** | 5 directional gestures + "no gesture", continuous, no activation gesture | **v4 "pause, then swipe", Nov 19.** Deployed `models/gesture_v4_pause.json` (11 sessions): 84.5% held-out accuracy, 91.1% precision with 61.3% of gestures recognised; left and right confused with each other 1/54 held out. Hold the hand still at the start, then swipe (Section 4.5). Left/right still needs more live-trigger recordings. `gesture_v3` (natural wind-up style) is kept for reference. |
 
 **The proof of concept is recorded in a room with car-like seating** (2 front,
 2 back, front row ~0.7-1.0 m from the radar), with four occupants (2 men,
@@ -352,6 +352,21 @@ positions.
 * **Rule:** record training data with the same trigger and the same natural
   movement as live use. Test a model on `live_style_test/`, not only on
   `direction_test/`.
+* **Nov 19: "pause, then swipe" adopted.** Live left/right failed with
+  `gesture_v3` although model and code were unchanged. The cue the model relies
+  on -- which board the hand reaches first -- was reversed in 12 new natural
+  swipes (`live_style_test_1119/`): left->right reached board 2 first in 77% of
+  September swipes and 100% of Oct 12 ones, but in 0% of today's, the same as
+  every Enter-armed swipe. The September captures held the *wind-up* (the hand
+  travelling into position, the opposite way), so `gesture_v3` only works when
+  the trigger catches a wind-up, which varies by person and day. The stroke itself
+  is consistent, so live use now asks for a brief pause before the swipe.
+  `gesture_dataset_v4_pause/` = September up/down/push/no-gesture + the Enter-style
+  sessions + `direction_test/` + G11191210; September left/right are excluded.
+  Held out, `gesture_v4_pause` confuses left and right 1/54 (`gesture_v3` on
+  today's swipes: 4/12 wrong way), but left/right is often read as `PUSH_IN` and
+  falls below the 0.80 floor: only 12 of its 33 swipes per direction come from
+  the live trigger.
 
 ### 4.6 Limitations
 * **Left vs right** is the weaker distinction at the current mounting, because
@@ -572,10 +587,13 @@ within sittings.
 python x7_gesture_live.py --host1 529 --host2 545 --calibrate 0
 python x7_gesture_live.py --host1 529 --host2 545 --calibrate 0 --log gesture_live_log   # save every capture
 ```
-Uses `models/gesture_v3.json` (check the `model ...` line in the header).
-See Section 4.5 for why the Oct 5 relabelled model was dropped. Keep still until "warming up"
-finishes (3 s), then swipe naturally. The confidence and margin floors come from
-the model (0.65 / 0.40); override them with `--confidence` and `--margin`.
+Uses `models/gesture_v4_pause.json` (check the `model ...` line in the header;
+`--model models/gesture_v3.json` for the old natural-wind-up model).
+See Section 4.5 for why the capture style matters. Keep still until "warming up"
+finishes (3 s). For each gesture, **hold the hand still at the start for a
+moment, then swipe** -- a swipe with a wind-up can be read as the opposite one.
+The confidence and margin floors come from the model (0.80 / 0.00 for
+`gesture_v4_pause`); override them with `--confidence` and `--margin`.
 `--model PATH` selects another model. Output:
 `>>> SWIPE_LR (97.3%) [4 ms]`, or `ignored: not a gesture / low confidence ...`.
 Other options: `--trigger-x` (default 6), `--timeout` (s per calibration
@@ -583,7 +601,7 @@ prompt).
 
 **Session calibration** is not needed on this setup (the base model holds
 across days). `--calibrate N` asks for N captures per class, saves them to
-`gesture_dataset_v3/` as session `C…` (automatic trigger, as in live), and
+`gesture_dataset_v4_pause/` as session `C…` (automatic trigger, as in live), and
 fine-tunes the ensemble in a
 separate process (~15 s; Ctrl+C skips). It raises the confidence floor to at
 least 0.8, which cancels the margin floor's gain; `--no-save-calibration`
@@ -619,21 +637,22 @@ The automatic trigger captures it exactly as live detection does.
 #### Training
 ```powershell
 python x7_gesture_train.py --target-precision 0.9 --out models/_trial_new.json   # trial (~12 min)
-python x7_gesture_train.py --target-precision 0.9                                # overwrites gesture_v3
+python x7_gesture_train.py --target-precision 0.9                                # overwrites gesture_v4_pause
 ```
-* Trains on every session in `gesture_dataset_v3/`, prints the held-out
+* Trains on every session in `gesture_dataset_v4_pause/`, prints the held-out
   accuracy per session, the confusion matrix and a floor table, then trains
   the final 3-model ensemble on all data.
-* It **overwrites** `models/gesture_v3.*`; use `--out` for a trial model.
+* It **overwrites** `models/gesture_v4_pause.*`; use `--out` for a trial model.
 * Options: `--channels {angle,angle+amp,angle+amp+doppler}`, `--no-reverse`,
   `--epochs` (60), `--seeds` (3), `--data`, `--pretrain-corpus DIR`
   (measured to hurt).
 * The default `--target-precision` is still 0.95, which picks a floor too
   strict for live use (17-44% recall). Pass 0.9.
-* Before promoting a trial model, score it on `live_style_test/` (natural
-  left/right swipes captured the live way); `gesture_v3` gets 9/12.
-* To promote a trial: back up `models/gesture_v3*`, then retrain without `--out`
-  (or copy the trial files over the `gesture_v3` names and edit the `weights`
+* Before promoting a trial model, score it on a new "pause, then swipe" session
+  recorded with `--gestures SWIPE_LR SWIPE_RL --out <test dir>` and kept out of
+  training (`live_style_test/` is the old wind-up style).
+* To promote a trial: back up `models/gesture_v4_pause*`, then retrain without `--out`
+  (or copy the trial files over the `gesture_v4_pause` names and edit the `weights`
   list inside the json to match).
 
 #### Legacy (`x7_2s_*`, earlier mountings -- reference only)
@@ -695,12 +714,15 @@ python x7_2s_train_presence_seats.py --data human_dataset_v2                  # 
 | `x7_gesture_record.py` | shuffled session recorder: automatic trigger (as live; `--manual` = Enter), direction check, `--gestures` |
 | `x7_gesture_train.py` | leave-one-session-out training, floor selection, ensemble |
 | `x7_gesture_live.py` | live recognition, optional session calibration |
-| `models/gesture_v3.json` + `gesture_v3_seed{0,1,2}.pt` | **deployed model** (Sep 30, 7 sessions, floors 0.65 / 0.40) |
+| `models/gesture_v4_pause.json` + `gesture_v4_pause_seed{0,1,2}.pt` | **deployed model** (Nov 19, 11 sessions, "pause, then swipe", floors 0.80 / 0.00) |
+| `models/gesture_v3.json` + `gesture_v3_seed{0,1,2}.pt` | previous model (Sep 30, natural wind-up style, floors 0.65 / 0.40) |
 | `models/*_heldout.npz` | held-out predictions from each training run |
 | `models/_unswap_LRRL_20261012_log.json` | rename log of the Oct 12 undo of the Oct 5 relabelling |
-| `gesture_dataset_v3/` | training recordings (automatic trigger), `LABEL_SESSION_ts_idx.npy`, 64 x 2 x 2 x 2 x 34 complex; 7 sessions |
+| `gesture_dataset_v4_pause/` | **current training set** ("pause, then swipe"; see Section 4.5 for what it contains); recorder default |
+| `gesture_dataset_v3/` | September recordings (automatic trigger, natural wind-up), `LABEL_SESSION_ts_idx.npy`, 64 x 2 x 2 x 2 x 34 complex; 7 sessions |
 | `gesture_dataset_enter_style/` | the two Oct 5 sessions (G10051022, G10051151), Enter-style captures; not trained on |
-| `live_style_test/` | 12 natural LR/RL swipes, automatic trigger (Oct 12); **the** left/right test set |
+| `live_style_test/` | 12 natural LR/RL swipes, automatic trigger (Oct 12); wind-up style |
+| `live_style_test_1119/` | 12 LR/RL swipes, automatic trigger (Nov 19), stroke signature; also in `gesture_dataset_v4_pause/` |
 | `direction_test/` | 10 deliberate Enter-armed LR/RL swipes (Oct 5); test set for the Enter style |
 | `gesture_live_rl/`, `gesture_live_corrected/` | logged live captures from the Oct 5 tests |
 | `x7_2s_record.py` | still provides the gesture radar class used by `x7_acq_worker` |
@@ -739,6 +761,7 @@ measurements, errors found (including our own), current state and lessons:
 | 2026-09-30 | gesture: holds across days (83% frozen model); 7 sessions, margin floor, 90% precision / 77% recall; seat-shift and SWIPE_RL analysis |
 | 2026-10-05 | September left/right labels judged reversed and relabelled (undone Oct 12, see Section 4.5); manual Enter trigger; direction test |
 | 2026-10-12 | Oct 5 relabelling found wrong and undone (live-style test 9/12 vs 0/12); recorder back to automatic trigger; presence recalibrated (+3 bins), empty step fails |
+| 2026-11-19 | gesture left/right failing live: the captured board order had reversed (wind-up vs stroke); switched to "pause, then swipe", `gesture_v4_pause` deployed |
 
 **Lessons that shaped the current design**
 * Run the control before reporting the number: a classifier on empty range

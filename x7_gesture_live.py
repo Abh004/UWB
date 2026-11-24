@@ -52,6 +52,10 @@ CAL_EPOCHS = 15
 CAL_LR = 5e-4
 CAL_REPEAT = 8          # calibration captures weighted up against the stored data
 CAL_FLOOR = 0.8         # confidence floor after calibration (measured ~76% precision)
+# Per-class confidence floors that replace the global one. At the v5 mounting the
+# up/down swipes come out at 51-67% while the other gestures reach 85-99%, so a
+# single 0.85 floor rejected every UD/DU (Nov 24 live run).
+CLASS_FLOORS = {"SWIPE_UD": 0.50, "SWIPE_DU": 0.50}
 CAL_TIMEOUT_S = 240     # give up and keep the base model after this long
 
 
@@ -190,15 +194,31 @@ def calibrate(radar, seg, model, args):
     print(f"\n[CALIBRATION] done in {time.time() - t0:.0f} s")
 
 
+def parse_class_floors(items, classes):
+    """--class-confidence CLASS=FLOOR ... -> {class: floor}. None -> CLASS_FLOORS."""
+    if items is None:
+        return {k: v for k, v in CLASS_FLOORS.items() if k in classes}
+    if [s.lower() for s in items] == ["none"]:
+        return {}
+    out = {}
+    for s in items:
+        name, sep, val = s.partition("=")
+        if not sep or name not in classes or name == "NO_GESTURE":
+            raise SystemExit(f"--class-confidence: bad entry '{s}' "
+                             f"(use CLASS=FLOOR with a gesture from {', '.join(classes[:-1])})")
+        out[name] = float(val)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host1", required=True)
     ap.add_argument("--host2", required=True)
-    ap.add_argument("--model", default=os.path.join("models", "gesture_v3.json"))
+    ap.add_argument("--model", default=os.path.join("models", "gesture_v4_pause.json"))
     ap.add_argument("--calibrate", type=int, default=2,
                     help="captures per class for session calibration (0 = skip)")
-    ap.add_argument("--data", default="gesture_dataset_v3",
+    ap.add_argument("--data", default="gesture_dataset_v4_pause",
                     help="stored dataset mixed into calibration, and where it is saved")
     ap.add_argument("--no-save-calibration", dest="no_save_calibration", action="store_true")
     ap.add_argument("--timeout", type=float, default=8.0)
@@ -206,6 +226,11 @@ def main():
                     help=f"trigger multiple of the idle level (default from the model, {C.TRIGGER_X:g})")
     ap.add_argument("--confidence", type=float, default=None, help="override the confidence floor")
     ap.add_argument("--margin", type=float, default=None, help="override the margin floor")
+    ap.add_argument("--class-confidence", dest="class_confidence", nargs="+", default=None,
+                    metavar="CLASS=FLOOR",
+                    help="per-class confidence floors, e.g. SWIPE_UD=0.5 SWIPE_DU=0.5 "
+                         f"(default {' '.join(f'{k}={v:g}' for k, v in CLASS_FLOORS.items())}; "
+                         "'none' to use the global floor for every class)")
     ap.add_argument("--log", default=None, help="save every live capture to this folder")
     args = ap.parse_args()
 
@@ -246,8 +271,12 @@ def main():
             th["confidence"] = args.confidence
         if args.margin is not None:
             th["margin"] = args.margin
-        print(f"\n[READY] floors: confidence {th['confidence']:.2f}, margin {th['margin']:.2f}. "
-              f"Perform a gesture.\n")
+        th["class_confidence"] = parse_class_floors(args.class_confidence, model.classes)
+        per_class = "".join(f", {k} {v:.2f}" for k, v in th["class_confidence"].items())
+        print(f"\n[READY] floors: confidence {th['confidence']:.2f}{per_class}, "
+              f"margin {th['margin']:.2f}. "
+              f"Perform a gesture: hold your hand still at the start for a moment, "
+              f"then swipe.\n")
         seg.reset_capture()
 
         stalls = 0
