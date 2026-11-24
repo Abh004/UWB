@@ -27,10 +27,13 @@ Inference is tiny and unaffected; three fine-tuning passes are not.
 
     --calibrate 0   skip calibration
     --log DIR       save every live capture (named by the prediction)
+    --gui           window with the gesture animation and its full name
+                    (x7_gesture_gui.py, runs in its own process)
 
 Usage:
     python x7_gesture_live.py --host1 529 --host2 545
     python x7_gesture_live.py --host1 529 --host2 545 --calibrate 3 --log gesture_live_log
+    python x7_gesture_live.py --host1 529 --host2 545 --gui
 """
 
 import os
@@ -46,6 +49,7 @@ from pathlib import Path
 import numpy as np
 
 import x7_gesture_core as C
+from x7_gesture_gui import GestureDisplay, NullDisplay
 from x7_gesture_record import open_radar, report_range, check_lag, keypress
 
 CAL_EPOCHS = 15
@@ -114,7 +118,7 @@ def next_capture(radar, seg, timeout, label=None):
     return None
 
 
-def calibrate(radar, seg, model, args):
+def calibrate(radar, seg, model, args, ui=NullDisplay()):
     import x7_gesture_train as T
     plan = [g for g in model.classes for _ in range(args.calibrate)]
     for _ in range(100):
@@ -129,6 +133,7 @@ def calibrate(radar, seg, model, args):
     while queue:
         label = queue.pop(0)
         print(f"  [{len(caps) + 1:2d}/{len(plan)}] {label:<11} {C.DESCRIPTION[label]}")
+        ui.prompt(label, len(caps) + 1, len(plan))
         print("        GO", end="", flush=True)
         got = next_capture(radar, seg, args.timeout)    # automatic, as live captures it
         if got is None:
@@ -162,6 +167,7 @@ def calibrate(radar, seg, model, args):
     cal_path = os.path.join(tmp, "cal.npz")
     np.savez(cal_path, w=np.stack([c["w"] for c in caps]),
              labels=np.array([c["label"] for c in caps]), session=session)
+    ui.status("calibration captured — fine-tuning the model, please wait")
     print(f"[CALIBRATION] fine-tuning {len(model.models)} models in a separate process "
           f"(Ctrl+C skips it and keeps the base model) ...", flush=True)
     proc = mp.get_context("spawn").Process(
@@ -232,6 +238,8 @@ def main():
                          f"(default {' '.join(f'{k}={v:g}' for k, v in CLASS_FLOORS.items())}; "
                          "'none' to use the global floor for every class)")
     ap.add_argument("--log", default=None, help="save every live capture to this folder")
+    ap.add_argument("--gui", action="store_true",
+                    help="show a window with the gesture animation and its full name")
     args = ap.parse_args()
 
     if not os.path.exists(args.model):
@@ -250,6 +258,8 @@ def main():
     if log:
         log.mkdir(parents=True, exist_ok=True)
 
+    ui = GestureDisplay() if args.gui else NullDisplay()
+    ui.status("connecting to the radar…")
     radar = open_radar(args.host1, args.host2)
     seg = C.Segmenter(args.trigger_x or model.meta.get("trigger_x", C.TRIGGER_X))
     try:
@@ -263,9 +273,10 @@ def main():
             sys.stdout.flush()
         report_range(radar)
         print(f"\n[INFO] idle level {seg.level:.0f}, trigger {seg.threshold:.0f}")
+        ui.status("radar ready")
 
         if args.calibrate > 0:
-            calibrate(radar, seg, model, args)
+            calibrate(radar, seg, model, args, ui)
             th["confidence"] = max(th["confidence"], CAL_FLOOR)
         if args.confidence is not None:
             th["confidence"] = args.confidence
@@ -277,6 +288,7 @@ def main():
               f"margin {th['margin']:.2f}. "
               f"Perform a gesture: hold your hand still at the start for a moment, "
               f"then swipe.\n")
+        ui.status("ready — hold your hand still for a moment, then swipe")
         seg.reset_capture()
 
         stalls = 0
@@ -286,6 +298,7 @@ def main():
                 stalls += 1
                 if stalls in (2, 10) or stalls % 30 == 0:
                     print(f"\n[WARN] no frames for ~{stalls * 2} s -- check the radar")
+                    ui.status(f"no radar frames for ~{stalls * 2} s — check the radar")
                 continue
             stalls = 0
             if seg.n % 200 == 0:
@@ -299,8 +312,10 @@ def main():
             ms = (time.perf_counter() - t0) * 1000
             if label:
                 print(f"  >>> {label:<9} ({conf * 100:4.1f}%)   [{ms:.0f} ms]")
+                ui.detected(label, conf)
             else:
                 print(f"      ignored: {why}")
+                ui.ignored(why, conf)
             if log:
                 tag = label or ("NO_GESTURE" if why == "not a gesture" else "UNSURE")
                 np.save(log / f"{tag}_live{time.strftime('%m%d')}_{int(time.time())}_"
@@ -309,6 +324,7 @@ def main():
         print("\n[INFO] stopped")
     finally:
         radar.close()
+        ui.close()
 
 
 if __name__ == "__main__":
