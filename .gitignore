@@ -2,6 +2,11 @@
 novelda-uwb-demos/
 .venv/
 venv/
+.venv-build/
+
+# PyInstaller output (build_exe.ps1)
+build/
+dist/
 
 # Exclude Python compiled files
 **/__pycache__/

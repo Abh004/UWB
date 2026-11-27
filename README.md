@@ -476,6 +476,11 @@ only and does not need the GPU at all.
   error *"Could not find a FT4222 device configured in mode 0 ... DCNF0/1
   jumpers"* almost never means the jumpers: it means a board is unplugged or a
   stale process still holds the device (then replug the USB).
+* **No frames although all 4 interfaces are present** (`SENSOR FAULT: no
+  frames`), typically after a live run was force-killed: replug both USB
+  cables. Stop live runs with Ctrl+C. If a stream fails, the run now stops
+  with the SDK's error instead of waiting forever; `X7_WORKER_LOG=<file>`
+  captures the radar worker's full output (Section 6.3).
 
 ---
 
@@ -665,7 +670,94 @@ python x7_2s_eval.py --model models\best_model_2s_5class.pth --mode split
 
 ---
 
-### 3. Superseded presence tools (reference only)
+### 3. GUI, combined presence + gesture, and the packaged app (`X7App.exe`)
+
+#### The window (`x7_gesture_gui.py`)
+A Tk window that animates the recognised gesture with its full name
+(`SWIPE_LR` -> "Left to Right"), the confidence and the last five detections.
+During calibration it loops the gesture to perform next. In combined mode it
+adds a cabin panel (status, front / back row) and a bar showing which radar
+preset is running. It runs as a **separate process** fed JSON lines on stdin:
+the radar SDK holds the GIL while waiting for frames, so an in-process
+animation would stutter. Closing the window never stops recognition.
+```powershell
+python x7_gesture_live.py --host1 529 --host2 545 --gui       # gesture only, with window
+python x7_gesture_gui.py --demo                               # window only, fake events, no radar
+```
+
+#### Combined presence + gesture (`x7_live_combined.py`)
+Presence and gesture need incompatible presets (presence: 3000 iterations per
+frame at 5 FPS to see breathing; gesture: 6 at 40 FPS), so the radar
+alternates: presence until `OCCUPIED`, then gestures until 60 s without
+movement (`--recheck-idle`), then a presence recheck.
+```powershell
+python x7_live_combined.py --host1 529 --host2 545            # with window (--no-gui for console only)
+python x7_live_combined.py --simulate --speed 4               # replays human_dataset_v3 + gesture_dataset_v4_pause, no radar
+```
+
+#### Packaged app (`X7App.exe`)
+The live tools as one Windows program that runs on a PC without Python and
+without this repository (Nov 27, `documentation/2026-11-27.md`). Built with
+PyInstaller as a **folder** (`dist\X7App\`, ~550 MB, of which torch ~360 MB),
+not a single file: a one-file exe would unpack torch to a temp folder on every
+launch.
+```powershell
+.\dist\X7App\X7App.exe                                        # menu (what a double-click shows)
+.\dist\X7App\X7App.exe selfcheck                              # run first on a new PC
+.\dist\X7App\X7App.exe combined --host1 529 --host2 545       # = x7_live_combined.py
+.\dist\X7App\X7App.exe gesture  --host1 529 --host2 545       # = x7_gesture_live.py --gui
+.\dist\X7App\X7App.exe presence-setup calibrate --host1 529 --host2 545   # = x7_presence_setup.py
+.\dist\X7App\X7App.exe demo                                   # = x7_live_combined.py --simulate
+.\dist\X7App\X7App.exe gui-demo                               # = x7_gesture_gui.py --demo
+```
+Every option of the underlying script is passed through (`<mode> --help`).
+The same launcher runs from source: `python x7_app.py <mode> ...`.
+
+* **Folder layout.** `X7App.exe` and `_internal\` (Python, CPU torch, the
+  radar SDK in `sdk\`, the radar wrapper + flows + presets in `radar\`, the
+  BA22 firmware in `firmware\`). Next to the exe, so they can be swapped and
+  written: `models\` (deployed gesture and presence models,
+  `presence_calib.json`), `gesture_dataset_v4_pause\` (mixed into gesture
+  calibration; new calibration captures are saved there) and
+  `human_dataset_v3\` (demo). The app works from that folder whatever the
+  current directory, so keep it somewhere writable (not `Program Files`).
+* **`selfcheck`** checks without streaming: SDK loads from the bundle, every
+  Python node the flow files name imports, presets and firmware found, models
+  load, worker processes start, folder writable, 4 FT4222H interfaces present.
+* **Stopping.** Use **Ctrl+C**. Force-killing a live run (Task Manager,
+  `Stop-Process -Force`) can leave the FT4222 stuck: the boards still
+  enumerate but send no frames, from the app or from source, until both USB
+  cables are replugged.
+* **Worker log.** The radar worker's output (including the SDK's own
+  messages) is invisible when the console output is redirected. Set
+  `X7_WORKER_LOG` to capture it, for the app and for the Python scripts:
+  ```powershell
+  $env:X7_WORKER_LOG = "$env:TEMP\x7_worker.log"
+  ```
+
+#### Rebuilding the app
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+* Uses its own venv, `.venv-build`: Python **3.10.22** (standalone, from
+  `uv python install 3.10`), **CPU-only** torch 2.13, numpy, psutil,
+  PyInstaller 6.22 (`requirements-build.txt`). The CUDA torch in `.venv` would
+  add ~2.5 GB for three 470 KB models.
+* Python must be 3.10 (the SDK ships `PySignalFlow` for cp310 only) but **not
+  3.10.0**, the system Python here: its `dis` module crashes PyInstaller
+  (`IndexError: tuple index out of range` in `_get_const_info`).
+* What goes into the bundle is in `x7_app.spec`; the build script then copies
+  the six deployed model files and the two datasets next to the exe. Change
+  the model list in `build_exe.ps1` when a new model is deployed.
+* The build clears `PYTHONPATH`. This PC sets it to the Novelda `Utils`
+  folder, and the SDK `bin` folder is on `PATH`; the app must not depend on
+  either. `x7_paths.py` now locates the SDK, flows, presets and firmware for
+  source and packaged runs alike (the recorders used hard-coded
+  `C:\RR_02\...` paths).
+
+---
+
+### 4. Superseded presence tools (reference only)
 
 The count-CNN presence pipeline below was found to learn the **recording
 session, not the occupants**: every occupancy level had been recorded on its own
@@ -727,6 +819,17 @@ python x7_2s_train_presence_seats.py --data human_dataset_v2                  # 
 | `gesture_live_rl/`, `gesture_live_corrected/` | logged live captures from the Oct 5 tests |
 | `x7_2s_record.py` | still provides the gesture radar class used by `x7_acq_worker` |
 
+**GUI, combined mode and the packaged app**
+| file | purpose |
+|---|---|
+| `x7_gesture_gui.py` | the window (separate process, JSON lines on stdin); `--demo` |
+| `x7_live_combined.py` | presence + gesture on the one dual-X7 board, alternating presets; `--simulate` |
+| `x7_app.py` | launcher and menu; the entry point of `X7App.exe` |
+| `x7_paths.py` | where the SDK, radar flows/presets and firmware are (source or bundle); replaces hard-coded `C:\RR_02\...` paths |
+| `x7_selfcheck.py` | `selfcheck` mode: is this PC set up (SDK, flow nodes, models, workers, USB) |
+| `x7_app.spec`, `build_exe.ps1`, `requirements-build.txt` | PyInstaller build of `dist\X7App\` (see Section 6.3) |
+| `X7App_README.txt` | user notes shipped as `README.txt` next to the exe |
+
 **Gesture (superseded):** `x7_2s_live.py`, `x7_2s_debug_live.py`, `x7_2s_train.py`,
 `x7_2s_eval.py`, `models/m5_now_seed{0,1,2}.pth`, `models/best_model_2s_5class.pth`,
 `debug_captures/` (315 windows from earlier mountings).
@@ -762,6 +865,7 @@ measurements, errors found (including our own), current state and lessons:
 | 2026-10-05 | September left/right labels judged reversed and relabelled (undone Oct 12, see Section 4.5); manual Enter trigger; direction test |
 | 2026-10-12 | Oct 5 relabelling found wrong and undone (live-style test 9/12 vs 0/12); recorder back to automatic trigger; presence recalibrated (+3 bins), empty step fails |
 | 2026-11-19 | gesture left/right failing live: the captured board order had reversed (wind-up vs stroke); switched to "pause, then swipe", `gesture_v4_pause` deployed |
+| 2026-11-27 | packaged app `X7App.exe` (PyInstaller); path, process and SDK-node fixes; radar stream failures no longer hang; worker log |
 
 **Lessons that shaped the current design**
 * Run the control before reporting the number: a classifier on empty range

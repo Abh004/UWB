@@ -1,6 +1,4 @@
 import os
-os.add_dll_directory(r"C:\RR_02\bin") 
-
 import sys
 import json
 import tempfile
@@ -11,11 +9,8 @@ import queue
 from pathlib import Path
 import numpy as np
 
-_DEMO_DIR = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback"
-_DEMO_PARENT = r"C:\RR_02\novelda-uwb-demos\Demos"
-for path in [_DEMO_PARENT, _DEMO_DIR]:
-    if path not in sys.path:
-        sys.path.insert(0, path)
+import x7_paths
+x7_paths.setup_radar_imports()
 
 from radar_direct_callback import RadarDirectCallback
 
@@ -39,7 +34,7 @@ class X7DualRadar:
         self.frame_queue = queue.Queue(maxsize=400)
         self.range_bins = RANGE_BINS
         if preset_json_path is None:
-            preset_json_path = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback\Presets\default_preset.json"
+            preset_json_path = x7_paths.preset("default_preset.json")
         
         self.host1 = host1
         self.host2 = host2
@@ -79,7 +74,8 @@ class X7DualRadar:
         if "ConnectionParameters" not in preset:
             preset["ConnectionParameters"] = {}
         preset["ConnectionParameters"]["HostInterfaceId"] = str(host_id)
-        
+        x7_paths.fix_firmware_path(preset)
+
         temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
         json.dump(preset, temp_file)
         temp_file.close()

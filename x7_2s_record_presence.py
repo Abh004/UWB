@@ -24,8 +24,6 @@ Usage:
 """
 
 import os
-os.add_dll_directory(r"C:\RR_02\bin")
-
 import sys
 import json
 import tempfile
@@ -40,11 +38,8 @@ import numpy as np
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-_DEMO_DIR = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback"
-_DEMO_PARENT = r"C:\RR_02\novelda-uwb-demos\Demos"
-for path in [_DEMO_PARENT, _DEMO_DIR]:
-    if path not in sys.path:
-        sys.path.insert(0, path)
+import x7_paths
+x7_paths.setup_radar_imports()
 
 from radar_direct_callback import RadarDirectCallback
 
@@ -76,8 +71,7 @@ SYNC_TOLERANCE = 0.1          # informational only; pairing is by sequence numbe
 # single source of truth.
 from x7_physics import BIN_LENGTH_M, RANGE_OFFSET_M
 
-DEFAULT_PRESET = (r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect"
-                  r"\X7RadarDirectCallback\Presets\human_preset.json")
+DEFAULT_PRESET = x7_paths.preset("human_preset.json")
 
 # Measured on 2026-09-10: the stock preset returns 112 bins spanning
 # -1.38 m .. 6.55 m. This is the EXPECTED value only; the recorder allocates
@@ -132,6 +126,7 @@ class X7DualRadar:
             preset = json.load(f)
         preset.setdefault("ConnectionParameters", {})
         preset["ConnectionParameters"]["HostInterfaceId"] = str(host_id)
+        x7_paths.fix_firmware_path(preset)
         # FPS and integration are set together so they cannot drift apart.
         rs = preset.setdefault("RadarSource", {})
         rs["FPS"] = f"{float(self.fps):.1f}"

@@ -34,9 +34,6 @@ Usage:
 """
 
 import os
-if hasattr(os, "add_dll_directory") and os.path.isdir(r"C:\RR_02\bin"):
-    os.add_dll_directory(r"C:\RR_02\bin")
-
 import sys
 import time
 import random
@@ -48,11 +45,8 @@ import numpy as np
 
 import x7_gesture_core as C
 
-_DEMO_DIR = r"C:\RR_02\novelda-uwb-demos\Demos\RadarDirect\X7RadarDirectCallback"
-_DEMO_PARENT = r"C:\RR_02\novelda-uwb-demos\Demos"
-for _p in (_DEMO_PARENT, _DEMO_DIR):
-    if _p not in sys.path and os.path.isdir(_p):
-        sys.path.insert(0, _p)
+import x7_paths
+x7_paths.setup_radar_imports()
 
 
 def open_radar(host1, host2):

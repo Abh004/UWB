@@ -1,0 +1,6 @@
+# Build environment for X7App.exe (see build_exe.ps1). Python 3.10.
+# torch is installed separately, CPU-only:
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+numpy==2.2.6
+psutil==7.2.2
+pyinstaller==6.22.3

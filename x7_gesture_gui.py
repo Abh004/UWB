@@ -86,9 +86,13 @@ def presence_summary(st):
 # --------------------------------------------------------------------------- #
 class GestureDisplay:
     def __init__(self, title="X7 Gesture"):
-        self._p = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--child", "--title", title],
-            stdin=subprocess.PIPE, text=True, encoding="utf-8")
+        if getattr(sys, "frozen", False):
+            # X7App.exe: there is no .py to run; the exe itself opens the window
+            # when started with --gui-child (handled first thing in x7_app.py)
+            cmd = [sys.executable, "--gui-child", "--title", title]
+        else:
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--child", "--title", title]
+        self._p = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True, encoding="utf-8")
 
     def _send(self, **msg):
         if self._p is None or self._p.poll() is not None:

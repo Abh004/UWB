@@ -100,14 +100,55 @@ def _make_gesture_radar(host1, host2):
     return _Probed(host1, host2)
 
 
+def _log_to_file(path):
+    """X7_WORKER_LOG=<file>: send this worker's output there -- Python prints
+    and the radar SDK's own (native) messages. Without it they are lost
+    whenever the parent's output is redirected, because Windows does not pass
+    redirected handles on to spawned children."""
+    if not path:
+        return
+    import sys
+    try:
+        f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    f.write(f"\n=== radar worker {os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    for fd in (1, 2):
+        try:
+            os.dup2(f.fileno(), fd)          # native SDK output
+        except OSError:
+            pass
+    sys.stdout = sys.stderr = f              # Python output
+
+
 def _worker(host1, host2, fps, preset, out_q, stop_evt, ready_evt, err_q,
             parent_pid=None, kind="presence", info_q=None):
     """Child process: own the radar, forward frames, keep Python work minimal."""
+    _log_to_file(os.environ.get("X7_WORKER_LOG"))
     radar_box = {"radar": None}
     if parent_pid is not None:
         threading.Thread(target=_parent_watchdog,
                          args=(parent_pid, stop_evt, radar_box),
                          daemon=True).start()
+
+    # The SDK streams from threads (X7DualRadar -> run_with_callback_preset).
+    # If one dies -- e.g. flow.load() fails -- no frame ever arrives, and the
+    # parent used to wait forever. A child's stderr is also not reliably visible
+    # (Windows does not hand redirected handles to spawned children), so the
+    # error is sent upstream and the worker exits; RadarProcess.get_frame()
+    # then raises it in the parent.
+    stream_failed = threading.Event()
+    _default_hook = threading.excepthook
+
+    def _thread_died(a):
+        try:
+            err_q.put(f"radar stream thread failed -- {a.exc_type.__name__}: {a.exc_value}")
+        except Exception:
+            pass
+        stream_failed.set()
+        _default_hook(a)
+
+    threading.excepthook = _thread_died
     try:
         if kind == "gesture":
             radar = _make_gesture_radar(host1, host2)
@@ -127,8 +168,8 @@ def _worker(host1, host2, fps, preset, out_q, stop_evt, ready_evt, err_q,
     ready_evt.set()
     sent_info = False
     try:
-        while not stop_evt.is_set():
-            frame = radar.get_frame()
+        while not stop_evt.is_set() and not stream_failed.is_set():
+            frame = radar.get_frame()               # returns None after 2 s
             if frame is None:
                 continue
             if not sent_info and info_q is not None and getattr(radar, "range_info", None):
@@ -157,20 +198,29 @@ def find_stale_workers():
 
     Returns [(pid, dead_parent_pid)]. A spawned child's command line carries
     parent_pid=N; if N is gone, nothing will ever reap it.
+
+    From source the child is python.exe running "spawn_main(parent_pid=N, ...)";
+    in the packaged app it is X7App.exe with "--multiprocessing-fork
+    parent_pid=N ...". Either kind holds the radar, so both are looked for.
     """
+    import re
+    import sys
     try:
         import psutil
     except ImportError:
         return []
+    names = {os.path.basename(sys.executable).lower()} if getattr(sys, "frozen", False) else set()
     out = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
-            if not (proc.info["name"] or "").lower().startswith("python"):
+            name = (proc.info["name"] or "").lower()
+            if not (name.startswith("python") or name in names or name == "x7app.exe"):
                 continue
             cmd = " ".join(proc.info["cmdline"] or ())
-            if "spawn_main" not in cmd or "parent_pid=" not in cmd:
+            m = re.search(r"parent_pid=(\d+)", cmd)
+            if not m or ("spawn_main" not in cmd and "--multiprocessing-fork" not in cmd):
                 continue
-            ppid = int(cmd.split("parent_pid=")[1].split(",")[0].split(")")[0])
+            ppid = int(m.group(1))
             if ppid != os.getpid() and not psutil.pid_exists(ppid):
                 out.append((proc.info["pid"], ppid))
         except Exception:
